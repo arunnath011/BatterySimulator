@@ -8,11 +8,16 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import random
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -38,7 +43,6 @@ st.set_page_config(
 # Custom CSS for light/dark mode compatibility
 st.markdown("""
 <style>
-    /* Header styling - uses CSS variables for theme compatibility */
     .main-header {
         font-size: 2.5rem;
         font-weight: 700;
@@ -53,7 +57,6 @@ st.markdown("""
         opacity: 0.8;
     }
     
-    /* Tab styling with theme-aware colors */
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
     }
@@ -63,13 +66,26 @@ st.markdown("""
         padding: 10px 20px;
     }
     
-    /* Ensure links are visible in both modes */
     .footer-link {
         opacity: 0.7;
     }
     
     .footer-link:hover {
         opacity: 1.0;
+    }
+    
+    .generator-status {
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+    }
+    
+    .status-running {
+        border-left: 4px solid #28a745;
+    }
+    
+    .status-stopped {
+        border-left: 4px solid #dc3545;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -102,7 +118,6 @@ def get_chemistry_info(chemistry_name: str) -> dict[str, Any]:
 
 def get_plotly_template() -> str:
     """Get Plotly template based on Streamlit theme."""
-    # Plotly templates that work well with light/dark modes
     return "plotly"
 
 
@@ -164,7 +179,6 @@ def create_capacity_retention_chart(cycle_summary: pd.DataFrame) -> go.Figure:
         marker=dict(size=6),
     ))
     
-    # Add 80% threshold line
     fig.add_hline(
         y=80,
         line_dash="dash",
@@ -256,28 +270,24 @@ def create_combined_cycle_chart(df: pd.DataFrame, cycle_num: int) -> go.Figure:
         horizontal_spacing=0.1,
     )
     
-    # Voltage
     fig.add_trace(
         go.Scatter(x=cycle_data["test_time"], y=cycle_data["voltage"], 
                    mode="lines", name="Voltage", line=dict(color="#1f77b4")),
         row=1, col=1
     )
     
-    # Current
     fig.add_trace(
         go.Scatter(x=cycle_data["test_time"], y=cycle_data["current"],
                    mode="lines", name="Current", line=dict(color="#ff7f0e")),
         row=1, col=2
     )
     
-    # SOC
     fig.add_trace(
         go.Scatter(x=cycle_data["test_time"], y=cycle_data["state_of_charge"] * 100,
                    mode="lines", name="SOC", line=dict(color="#2ca02c")),
         row=2, col=1
     )
     
-    # Temperature
     fig.add_trace(
         go.Scatter(x=cycle_data["test_time"], y=cycle_data["temperature"],
                    mode="lines", name="Temperature", line=dict(color="#d62728")),
@@ -291,7 +301,6 @@ def create_combined_cycle_chart(df: pd.DataFrame, cycle_num: int) -> go.Figure:
     fig.update_yaxes(title_text="SOC (%)", row=2, col=1)
     fig.update_yaxes(title_text="Temp (C)", row=2, col=2)
     
-    # Add grid to all subplots
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.2)")
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.2)")
     
@@ -316,10 +325,10 @@ def run_simulation(
     noise_voltage: float,
     noise_current: float,
     noise_temperature: float,
+    output_path: str | None = None,
 ) -> tuple[Any, pd.DataFrame, str]:
     """Run the battery simulation with given parameters."""
     
-    # Create simulation config
     config = SimulationConfig(
         timing_mode=TimingMode.INSTANT,
         enable_degradation=enable_degradation,
@@ -328,7 +337,6 @@ def run_simulation(
         noise_temperature=noise_temperature,
     )
     
-    # Create simulator
     sim = BatterySimulator(
         chemistry=chemistry,
         capacity=capacity,
@@ -336,7 +344,6 @@ def run_simulation(
         config=config,
     )
     
-    # Create protocol based on type
     if protocol_type == "Cycle Life":
         protocol = Protocol.cycle_life(
             charge_rate=protocol_params["charge_rate"],
@@ -370,11 +377,10 @@ def run_simulation(
     else:
         protocol = Protocol.cycle_life(cycles=protocol_params["cycles"])
     
-    # Create temp file for output
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
-        output_path = f.name
+    if output_path is None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            output_path = f.name
     
-    # Run simulation
     results = sim.run(
         protocol=protocol,
         output_path=output_path,
@@ -382,43 +388,155 @@ def run_simulation(
         show_progress=False,
     )
     
-    # Read the generated data
     df = pd.read_csv(output_path)
-    
-    # Clean up
-    Path(output_path).unlink(missing_ok=True)
     
     return results, df, output_path
 
 
+def generate_random_cell_params(
+    base_capacity: float,
+    base_temperature: float,
+    variation_capacity: float = 0.05,
+    variation_temperature: float = 2.0,
+) -> dict:
+    """Generate random cell parameters with variations."""
+    return {
+        "capacity": base_capacity * (1 + random.uniform(-variation_capacity, variation_capacity)),
+        "temperature": base_temperature + random.uniform(-variation_temperature, variation_temperature),
+        "charge_rate_variation": random.uniform(0.95, 1.05),
+        "discharge_rate_variation": random.uniform(0.95, 1.05),
+    }
+
+
+def run_batch_simulation(
+    chemistries: list[str],
+    cycler_format: str,
+    num_cells: int,
+    cycles_per_cell: int,
+    base_capacity: float,
+    base_temperature: float,
+    charge_rate: float,
+    discharge_rate: float,
+    output_folder: str,
+    enable_degradation: bool = True,
+    cell_variation: float = 0.05,
+) -> list[dict]:
+    """Run batch simulation for multiple cells."""
+    results_list = []
+    
+    os.makedirs(output_folder, exist_ok=True)
+    
+    for cell_idx in range(num_cells):
+        chemistry = random.choice(chemistries)
+        cell_params = generate_random_cell_params(
+            base_capacity, base_temperature, cell_variation
+        )
+        
+        chem_info = get_chemistry_info(chemistry)
+        
+        protocol_params = {
+            "temperature": cell_params["temperature"],
+            "cycles": cycles_per_cell,
+            "charge_rate": charge_rate * cell_params["charge_rate_variation"],
+            "discharge_rate": discharge_rate * cell_params["discharge_rate_variation"],
+            "voltage_max": chem_info["voltage_max"],
+            "voltage_min": chem_info["voltage_min"],
+            "rest_time": 300,
+        }
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"cell_{cell_idx+1:03d}_{chemistry}_{timestamp}.csv"
+        output_path = os.path.join(output_folder, filename)
+        
+        try:
+            results, df, _ = run_simulation(
+                chemistry=chemistry,
+                capacity=cell_params["capacity"],
+                protocol_type="Cycle Life",
+                protocol_params=protocol_params,
+                output_format=cycler_format,
+                enable_degradation=enable_degradation,
+                noise_voltage=0.001,
+                noise_current=0.005,
+                noise_temperature=0.5,
+                output_path=output_path,
+            )
+            
+            results_list.append({
+                "cell_id": cell_idx + 1,
+                "chemistry": chemistry,
+                "capacity": cell_params["capacity"],
+                "temperature": cell_params["temperature"],
+                "cycles_completed": results.cycles_completed,
+                "capacity_retention": results.capacity_retention,
+                "output_file": filename,
+                "status": "success",
+            })
+        except Exception as e:
+            results_list.append({
+                "cell_id": cell_idx + 1,
+                "chemistry": chemistry,
+                "status": "failed",
+                "error": str(e),
+            })
+    
+    return results_list
+
+
+def publish_to_mqtt(
+    data: dict,
+    broker: str,
+    port: int,
+    topic: str,
+    username: str | None = None,
+    password: str | None = None,
+) -> bool:
+    """Publish data to MQTT broker."""
+    try:
+        import paho.mqtt.client as mqtt
+        
+        client = mqtt.Client()
+        if username and password:
+            client.username_pw_set(username, password)
+        
+        client.connect(broker, port, 60)
+        payload = json.dumps(data, default=str)
+        result = client.publish(topic, payload)
+        client.disconnect()
+        
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
+    except ImportError:
+        st.error("MQTT support requires paho-mqtt. Install with: pip install paho-mqtt")
+        return False
+    except Exception as e:
+        st.error(f"MQTT publish failed: {e}")
+        return False
+
+
 # =============================================================================
-# Main Application
+# Page: Single Simulation
 # =============================================================================
 
-def main():
-    """Main Streamlit application."""
-    
-    # Header
+def page_single_simulation():
+    """Single simulation page."""
     st.markdown('<p class="main-header">Battery Test Data Simulator</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="sub-header">Generate realistic lithium-ion battery cycling data for development, testing, and demonstration</p>',
+        '<p class="sub-header">Generate realistic lithium-ion battery cycling data</p>',
         unsafe_allow_html=True
     )
     
-    # Sidebar - Configuration
     with st.sidebar:
         st.header("Simulation Configuration")
         
-        # Chemistry Selection
         st.subheader("1. Battery Chemistry")
         chemistry = st.selectbox(
             "Select Chemistry",
             options=["NMC811", "LFP", "NCA", "LTO"],
             index=0,
             help="Choose the battery chemistry type",
+            key="single_chemistry",
         )
         
-        # Display chemistry info
         chem_info = get_chemistry_info(chemistry)
         with st.expander("Chemistry Details", expanded=False):
             col1, col2 = st.columns(2)
@@ -431,7 +549,6 @@ def main():
                 st.metric("Max Charge Rate", f"{chem_info['max_charge_rate']}C")
                 st.metric("Max Discharge Rate", f"{chem_info['max_discharge_rate']}C")
         
-        # Cell Parameters
         st.subheader("2. Cell Parameters")
         capacity = st.number_input(
             "Capacity (Ah)",
@@ -440,6 +557,7 @@ def main():
             value=3.0,
             step=0.1,
             help="Nominal cell capacity in Amp-hours",
+            key="single_capacity",
         )
         
         temperature = st.number_input(
@@ -449,81 +567,56 @@ def main():
             value=25.0,
             step=1.0,
             help="Operating temperature",
+            key="single_temperature",
         )
         
-        # Protocol Selection
         st.subheader("3. Test Protocol")
         protocol_type = st.selectbox(
             "Select Protocol",
             options=["Cycle Life", "Formation", "Rate Capability", "RPT"],
             index=0,
             help="Choose the test protocol type",
+            key="single_protocol",
         )
         
-        # Protocol-specific parameters
         protocol_params = {"temperature": temperature}
         
         if protocol_type == "Cycle Life":
             with st.expander("Cycle Life Parameters", expanded=True):
                 protocol_params["cycles"] = st.number_input(
-                    "Number of Cycles",
-                    min_value=1,
-                    max_value=10000,
-                    value=10,
-                    step=1,
-                    help="Total cycles to simulate",
+                    "Number of Cycles", min_value=1, max_value=10000, value=10, step=1,
+                    key="single_cycles",
                 )
                 protocol_params["charge_rate"] = st.slider(
-                    "Charge Rate (C)",
-                    min_value=0.1,
-                    max_value=5.0,
-                    value=1.0,
-                    step=0.1,
+                    "Charge Rate (C)", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+                    key="single_charge_rate",
                 )
                 protocol_params["discharge_rate"] = st.slider(
-                    "Discharge Rate (C)",
-                    min_value=0.1,
-                    max_value=5.0,
-                    value=1.0,
-                    step=0.1,
+                    "Discharge Rate (C)", min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+                    key="single_discharge_rate",
                 )
                 protocol_params["voltage_max"] = st.number_input(
-                    "Max Voltage (V)",
-                    min_value=2.0,
-                    max_value=5.0,
-                    value=chem_info["voltage_max"],
-                    step=0.05,
+                    "Max Voltage (V)", min_value=2.0, max_value=5.0, value=chem_info["voltage_max"], step=0.05,
+                    key="single_voltage_max",
                 )
                 protocol_params["voltage_min"] = st.number_input(
-                    "Min Voltage (V)",
-                    min_value=1.0,
-                    max_value=4.0,
-                    value=chem_info["voltage_min"],
-                    step=0.05,
+                    "Min Voltage (V)", min_value=1.0, max_value=4.0, value=chem_info["voltage_min"], step=0.05,
+                    key="single_voltage_min",
                 )
                 protocol_params["rest_time"] = st.number_input(
-                    "Rest Time (s)",
-                    min_value=0,
-                    max_value=3600,
-                    value=300,
-                    step=60,
+                    "Rest Time (s)", min_value=0, max_value=3600, value=300, step=60,
+                    key="single_rest_time",
                 )
         
         elif protocol_type == "Formation":
             with st.expander("Formation Parameters", expanded=True):
                 protocol_params["cycles"] = st.number_input(
-                    "Number of Cycles",
-                    min_value=1,
-                    max_value=10,
-                    value=3,
-                    step=1,
+                    "Number of Cycles", min_value=1, max_value=10, value=3, step=1,
+                    key="single_form_cycles",
                 )
                 protocol_params["initial_rate"] = st.slider(
-                    "Initial C-Rate",
-                    min_value=0.05,
-                    max_value=0.5,
-                    value=0.1,
-                    step=0.05,
+                    "Initial C-Rate", min_value=0.05, max_value=0.5, value=0.1, step=0.05,
+                    key="single_initial_rate",
                 )
                 protocol_params["voltage_max"] = chem_info["voltage_max"]
                 protocol_params["voltage_min"] = chem_info["voltage_min"]
@@ -531,24 +624,17 @@ def main():
         elif protocol_type == "Rate Capability":
             with st.expander("Rate Capability Parameters", expanded=True):
                 rates_input = st.text_input(
-                    "Discharge Rates (C)",
-                    value="0.2, 0.5, 1.0, 2.0",
-                    help="Comma-separated C-rates to test",
+                    "Discharge Rates (C)", value="0.2, 0.5, 1.0, 2.0",
+                    key="single_rates",
                 )
                 protocol_params["rates"] = [float(r.strip()) for r in rates_input.split(",")]
                 protocol_params["cycles_per_rate"] = st.number_input(
-                    "Cycles per Rate",
-                    min_value=1,
-                    max_value=10,
-                    value=2,
-                    step=1,
+                    "Cycles per Rate", min_value=1, max_value=10, value=2, step=1,
+                    key="single_cycles_per_rate",
                 )
                 protocol_params["charge_rate"] = st.slider(
-                    "Charge Rate (C)",
-                    min_value=0.1,
-                    max_value=2.0,
-                    value=0.5,
-                    step=0.1,
+                    "Charge Rate (C)", min_value=0.1, max_value=2.0, value=0.5, step=0.1,
+                    key="single_rate_charge",
                 )
                 protocol_params["cycles"] = len(protocol_params["rates"]) * protocol_params["cycles_per_rate"]
                 protocol_params["voltage_max"] = chem_info["voltage_max"]
@@ -557,80 +643,49 @@ def main():
         elif protocol_type == "RPT":
             with st.expander("RPT Parameters", expanded=True):
                 protocol_params["charge_rate"] = st.slider(
-                    "Charge Rate (C)",
-                    min_value=0.1,
-                    max_value=1.0,
-                    value=0.33,
-                    step=0.01,
+                    "Charge Rate (C)", min_value=0.1, max_value=1.0, value=0.33, step=0.01,
+                    key="single_rpt_charge",
                 )
                 protocol_params["discharge_rate"] = st.slider(
-                    "Discharge Rate (C)",
-                    min_value=0.1,
-                    max_value=1.0,
-                    value=0.33,
-                    step=0.01,
+                    "Discharge Rate (C)", min_value=0.1, max_value=1.0, value=0.33, step=0.01,
+                    key="single_rpt_discharge",
                 )
                 protocol_params["pulse_current"] = st.slider(
-                    "Pulse Current (C)",
-                    min_value=0.5,
-                    max_value=3.0,
-                    value=1.0,
-                    step=0.1,
+                    "Pulse Current (C)", min_value=0.5, max_value=3.0, value=1.0, step=0.1,
+                    key="single_pulse_current",
                 )
                 protocol_params["cycles"] = 1
         
-        # Output Configuration
         st.subheader("4. Output Settings")
         output_format = st.selectbox(
             "Output Format",
             options=["Generic", "Arbin", "Neware", "Biologic"],
             index=0,
-            help="Choose the output file format",
+            key="single_format",
         )
         
-        # Advanced Settings
         with st.expander("Advanced Settings"):
             enable_degradation = st.checkbox(
-                "Enable Degradation",
-                value=True,
-                help="Simulate capacity fade and resistance growth",
+                "Enable Degradation", value=True, key="single_degradation",
             )
-            
             st.markdown("**Measurement Noise (Std Dev)**")
             noise_voltage = st.number_input(
-                "Voltage Noise (V)",
-                min_value=0.0,
-                max_value=0.01,
-                value=0.001,
-                step=0.0001,
-                format="%.4f",
+                "Voltage Noise (V)", min_value=0.0, max_value=0.01, value=0.001,
+                step=0.0001, format="%.4f", key="single_noise_v",
             )
             noise_current = st.number_input(
-                "Current Noise (A)",
-                min_value=0.0,
-                max_value=0.05,
-                value=0.005,
-                step=0.001,
-                format="%.3f",
+                "Current Noise (A)", min_value=0.0, max_value=0.05, value=0.005,
+                step=0.001, format="%.3f", key="single_noise_i",
             )
             noise_temperature = st.number_input(
-                "Temperature Noise (C)",
-                min_value=0.0,
-                max_value=2.0,
-                value=0.5,
-                step=0.1,
+                "Temperature Noise (C)", min_value=0.0, max_value=2.0, value=0.5,
+                step=0.1, key="single_noise_t",
             )
     
-    # Main content area
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        run_button = st.button(
-            "Run Simulation",
-            type="primary",
-            use_container_width=True,
-        )
+        run_button = st.button("Run Simulation", type="primary", use_container_width=True)
     
-    # Run simulation when button is clicked
     if run_button:
         with st.spinner("Running simulation... This may take a moment."):
             try:
@@ -646,18 +701,18 @@ def main():
                     noise_temperature=noise_temperature,
                 )
                 
-                # Store results in session state
                 st.session_state["results"] = results
                 st.session_state["df"] = df
                 st.session_state["run_complete"] = True
                 
                 st.success("Simulation completed successfully!")
                 
+                Path(output_path).unlink(missing_ok=True)
+                
             except Exception as e:
                 st.error(f"Simulation failed: {str(e)}")
                 st.session_state["run_complete"] = False
     
-    # Display results if available
     if st.session_state.get("run_complete", False):
         results = st.session_state["results"]
         df = st.session_state["df"]
@@ -665,104 +720,57 @@ def main():
         st.markdown("---")
         st.header("Simulation Results")
         
-        # Summary metrics
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
-            st.metric(
-                "Cycles Completed",
-                f"{results.cycles_completed}",
-            )
+            st.metric("Cycles Completed", f"{results.cycles_completed}")
         with col2:
-            st.metric(
-                "Capacity Retention",
-                f"{results.capacity_retention:.1%}",
-                delta=f"{(results.capacity_retention - 1) * 100:.2f}%",
-            )
+            st.metric("Capacity Retention", f"{results.capacity_retention:.1%}",
+                      delta=f"{(results.capacity_retention - 1) * 100:.2f}%")
         with col3:
-            st.metric(
-                "Energy Throughput",
-                f"{results.energy_throughput:.1f} Wh",
-            )
+            st.metric("Energy Throughput", f"{results.energy_throughput:.1f} Wh")
         with col4:
-            st.metric(
-                "Final Resistance",
-                f"{results.resistance_final * 1000:.1f} mOhm",
-                delta=f"+{(results.resistance_final / results.resistance_initial - 1) * 100:.1f}%",
-            )
+            st.metric("Final Resistance", f"{results.resistance_final * 1000:.1f} mOhm",
+                      delta=f"+{(results.resistance_final / results.resistance_initial - 1) * 100:.1f}%")
         with col5:
-            st.metric(
-                "Test Duration",
-                f"{(results.end_time - results.start_time).total_seconds():.1f}s",
-            )
+            st.metric("Test Duration", f"{(results.end_time - results.start_time).total_seconds():.1f}s")
         
-        # Tabs for different views
         tab1, tab2, tab3, tab4 = st.tabs([
-            "Degradation Analysis",
-            "Cycle Details",
-            "Raw Data",
-            "Export",
+            "Degradation Analysis", "Cycle Details", "Raw Data", "Export"
         ])
         
         with tab1:
-            # Capacity retention chart
             if not results.cycle_summary.empty:
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.plotly_chart(
-                        create_capacity_retention_chart(results.cycle_summary),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(create_capacity_retention_chart(results.cycle_summary), use_container_width=True)
                 with col2:
-                    st.plotly_chart(
-                        create_efficiency_chart(results.cycle_summary),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(create_efficiency_chart(results.cycle_summary), use_container_width=True)
         
         with tab2:
-            # Cycle selector
             max_cycle = int(df["cycle_index"].max()) if "cycle_index" in df.columns else 1
-            selected_cycle = st.slider(
-                "Select Cycle to View",
-                min_value=1,
-                max_value=max_cycle,
-                value=1,
-            )
+            selected_cycle = st.slider("Select Cycle to View", min_value=1, max_value=max_cycle, value=1)
             
-            # Combined cycle chart
             if "cycle_index" in df.columns:
-                st.plotly_chart(
-                    create_combined_cycle_chart(df, selected_cycle),
-                    use_container_width=True,
-                )
+                st.plotly_chart(create_combined_cycle_chart(df, selected_cycle), use_container_width=True)
             
-            # Voltage and SOC profiles
             col1, col2 = st.columns(2)
             with col1:
-                st.plotly_chart(
-                    create_voltage_profile_chart(df[df["cycle_index"] <= min(5, max_cycle)]),
-                    use_container_width=True,
-                )
+                st.plotly_chart(create_voltage_profile_chart(df[df["cycle_index"] <= min(5, max_cycle)]), use_container_width=True)
             with col2:
                 if "temperature" in df.columns:
-                    st.plotly_chart(
-                        create_temperature_chart(df[df["cycle_index"] <= min(5, max_cycle)]),
-                        use_container_width=True,
-                    )
+                    st.plotly_chart(create_temperature_chart(df[df["cycle_index"] <= min(5, max_cycle)]), use_container_width=True)
         
         with tab3:
             st.subheader("Raw Data Preview")
             st.dataframe(df.head(100), use_container_width=True)
-            
             st.markdown(f"**Total rows:** {len(df):,}")
             st.markdown(f"**Columns:** {', '.join(df.columns.tolist())}")
         
         with tab4:
             st.subheader("Export Data")
-            
             col1, col2 = st.columns(2)
             
             with col1:
-                # CSV download
                 csv_buffer = io.StringIO()
                 df.to_csv(csv_buffer, index=False)
                 st.download_button(
@@ -773,7 +781,6 @@ def main():
                 )
             
             with col2:
-                # JSON metadata download
                 metadata = results.to_dict()
                 st.download_button(
                     label="Download Metadata (JSON)",
@@ -782,7 +789,6 @@ def main():
                     mime="application/json",
                 )
             
-            # Cycle summary download
             if not results.cycle_summary.empty:
                 csv_summary = io.StringIO()
                 results.cycle_summary.to_csv(csv_summary, index=False)
@@ -792,6 +798,363 @@ def main():
                     file_name=f"battery_simulation_{results.test_id}_summary.csv",
                     mime="text/csv",
                 )
+
+
+# =============================================================================
+# Page: Automated Data Generator
+# =============================================================================
+
+def page_automated_generator():
+    """Automated data generator page."""
+    st.markdown('<p class="main-header">Automated Data Generator</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="sub-header">Generate batch battery data automatically with randomized parameters</p>',
+        unsafe_allow_html=True
+    )
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("1. Battery Configuration")
+        
+        available_chemistries = ["NMC811", "LFP", "NCA", "LTO"]
+        selected_chemistries = st.multiselect(
+            "Select Chemistries (random selection per cell)",
+            options=available_chemistries,
+            default=["NMC811", "LFP"],
+            help="Multiple chemistries will be randomly assigned to each cell",
+        )
+        
+        if not selected_chemistries:
+            st.warning("Please select at least one chemistry")
+            selected_chemistries = ["NMC811"]
+        
+        num_cells = st.number_input(
+            "Number of Cells to Simulate",
+            min_value=1,
+            max_value=100,
+            value=5,
+            step=1,
+            help="Each cell will have slightly randomized parameters",
+        )
+        
+        cycles_per_cell = st.number_input(
+            "Cycles per Cell",
+            min_value=1,
+            max_value=1000,
+            value=10,
+            step=1,
+        )
+        
+        st.subheader("2. Cell Parameters")
+        
+        base_capacity = st.number_input(
+            "Base Capacity (Ah)",
+            min_value=0.1,
+            max_value=100.0,
+            value=3.0,
+            step=0.1,
+        )
+        
+        base_temperature = st.number_input(
+            "Base Temperature (C)",
+            min_value=-20.0,
+            max_value=60.0,
+            value=25.0,
+            step=1.0,
+        )
+        
+        charge_rate = st.slider(
+            "Base Charge Rate (C)",
+            min_value=0.1,
+            max_value=5.0,
+            value=1.0,
+            step=0.1,
+        )
+        
+        discharge_rate = st.slider(
+            "Base Discharge Rate (C)",
+            min_value=0.1,
+            max_value=5.0,
+            value=1.0,
+            step=0.1,
+        )
+        
+        cell_variation = st.slider(
+            "Cell-to-Cell Variation (%)",
+            min_value=0,
+            max_value=20,
+            value=5,
+            step=1,
+            help="Random variation in capacity, temperature, and rates",
+        ) / 100.0
+    
+    with col2:
+        st.subheader("3. Output Configuration")
+        
+        cycler_format = st.selectbox(
+            "Cycler Data Format",
+            options=["Generic", "Arbin", "Neware", "Biologic"],
+            index=0,
+        )
+        
+        export_method = st.radio(
+            "Export Method",
+            options=["Folder Export", "MQTT Publish"],
+            index=0,
+            help="Choose how to export the generated data",
+        )
+        
+        if export_method == "Folder Export":
+            output_folder = st.text_input(
+                "Output Folder Path",
+                value="./generated_data",
+                help="Folder where CSV files will be saved",
+            )
+            
+            st.info(f"Files will be saved to: {os.path.abspath(output_folder)}")
+        
+        else:  # MQTT
+            st.subheader("MQTT Configuration")
+            mqtt_broker = st.text_input("MQTT Broker", value="localhost")
+            mqtt_port = st.number_input("MQTT Port", min_value=1, max_value=65535, value=1883)
+            mqtt_topic = st.text_input("MQTT Topic", value="battery/simulation/data")
+            
+            with st.expander("MQTT Authentication (Optional)"):
+                mqtt_username = st.text_input("Username", value="")
+                mqtt_password = st.text_input("Password", value="", type="password")
+        
+        st.subheader("4. Generation Settings")
+        
+        enable_degradation = st.checkbox("Enable Degradation Model", value=True)
+        
+        generation_mode = st.radio(
+            "Generation Mode",
+            options=["Single Batch", "Scheduled Generation"],
+            index=0,
+        )
+        
+        if generation_mode == "Scheduled Generation":
+            export_frequency = st.selectbox(
+                "Export Frequency",
+                options=["Every 1 minute", "Every 5 minutes", "Every 15 minutes", "Every 30 minutes", "Every hour"],
+                index=1,
+            )
+            
+            freq_map = {
+                "Every 1 minute": 60,
+                "Every 5 minutes": 300,
+                "Every 15 minutes": 900,
+                "Every 30 minutes": 1800,
+                "Every hour": 3600,
+            }
+            frequency_seconds = freq_map[export_frequency]
+            
+            st.warning("Scheduled generation will run in the background. Use 'Stop Generator' to halt.")
+    
+    st.markdown("---")
+    
+    # Summary
+    st.subheader("Generation Summary")
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        st.metric("Total Cells", num_cells)
+    with summary_cols[1]:
+        st.metric("Cycles per Cell", cycles_per_cell)
+    with summary_cols[2]:
+        st.metric("Total Cycles", num_cells * cycles_per_cell)
+    with summary_cols[3]:
+        st.metric("Chemistries", len(selected_chemistries))
+    
+    # Action buttons
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        if generation_mode == "Single Batch":
+            generate_button = st.button("Generate Data", type="primary", use_container_width=True)
+        else:
+            generate_button = st.button("Start Scheduled Generator", type="primary", use_container_width=True)
+    
+    with col2:
+        if generation_mode == "Scheduled Generation":
+            stop_button = st.button("Stop Generator", type="secondary", use_container_width=True)
+            if stop_button:
+                st.session_state["generator_running"] = False
+                st.info("Generator stopped.")
+    
+    # Handle generation
+    if generate_button:
+        if generation_mode == "Single Batch":
+            with st.spinner(f"Generating data for {num_cells} cells..."):
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                if export_method == "Folder Export":
+                    results_list = []
+                    
+                    for i in range(num_cells):
+                        status_text.text(f"Simulating cell {i+1}/{num_cells}...")
+                        progress_bar.progress((i + 1) / num_cells)
+                        
+                        chemistry = random.choice(selected_chemistries)
+                        cell_params = generate_random_cell_params(
+                            base_capacity, base_temperature, cell_variation
+                        )
+                        chem_info = get_chemistry_info(chemistry)
+                        
+                        protocol_params = {
+                            "temperature": cell_params["temperature"],
+                            "cycles": cycles_per_cell,
+                            "charge_rate": charge_rate * cell_params["charge_rate_variation"],
+                            "discharge_rate": discharge_rate * cell_params["discharge_rate_variation"],
+                            "voltage_max": chem_info["voltage_max"],
+                            "voltage_min": chem_info["voltage_min"],
+                            "rest_time": 300,
+                        }
+                        
+                        os.makedirs(output_folder, exist_ok=True)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        filename = f"cell_{i+1:03d}_{chemistry}_{timestamp}.csv"
+                        output_path = os.path.join(output_folder, filename)
+                        
+                        try:
+                            results, df, _ = run_simulation(
+                                chemistry=chemistry,
+                                capacity=cell_params["capacity"],
+                                protocol_type="Cycle Life",
+                                protocol_params=protocol_params,
+                                output_format=cycler_format,
+                                enable_degradation=enable_degradation,
+                                noise_voltage=0.001,
+                                noise_current=0.005,
+                                noise_temperature=0.5,
+                                output_path=output_path,
+                            )
+                            
+                            results_list.append({
+                                "Cell ID": i + 1,
+                                "Chemistry": chemistry,
+                                "Capacity (Ah)": f"{cell_params['capacity']:.2f}",
+                                "Temperature (C)": f"{cell_params['temperature']:.1f}",
+                                "Cycles": results.cycles_completed,
+                                "Retention": f"{results.capacity_retention:.1%}",
+                                "File": filename,
+                                "Status": "Success",
+                            })
+                        except Exception as e:
+                            results_list.append({
+                                "Cell ID": i + 1,
+                                "Chemistry": chemistry,
+                                "Status": f"Failed: {str(e)[:30]}",
+                            })
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("Generation complete!")
+                    
+                    st.success(f"Generated {len(results_list)} cell datasets in {output_folder}")
+                    
+                    # Show results table
+                    st.subheader("Generation Results")
+                    results_df = pd.DataFrame(results_list)
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # Save summary
+                    summary_path = os.path.join(output_folder, f"generation_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                    results_df.to_csv(summary_path, index=False)
+                    st.info(f"Summary saved to: {summary_path}")
+                
+                else:  # MQTT
+                    st.info("Generating and publishing to MQTT...")
+                    
+                    for i in range(num_cells):
+                        status_text.text(f"Simulating and publishing cell {i+1}/{num_cells}...")
+                        progress_bar.progress((i + 1) / num_cells)
+                        
+                        chemistry = random.choice(selected_chemistries)
+                        cell_params = generate_random_cell_params(
+                            base_capacity, base_temperature, cell_variation
+                        )
+                        chem_info = get_chemistry_info(chemistry)
+                        
+                        protocol_params = {
+                            "temperature": cell_params["temperature"],
+                            "cycles": cycles_per_cell,
+                            "charge_rate": charge_rate * cell_params["charge_rate_variation"],
+                            "discharge_rate": discharge_rate * cell_params["discharge_rate_variation"],
+                            "voltage_max": chem_info["voltage_max"],
+                            "voltage_min": chem_info["voltage_min"],
+                            "rest_time": 300,
+                        }
+                        
+                        try:
+                            results, df, output_path = run_simulation(
+                                chemistry=chemistry,
+                                capacity=cell_params["capacity"],
+                                protocol_type="Cycle Life",
+                                protocol_params=protocol_params,
+                                output_format=cycler_format,
+                                enable_degradation=enable_degradation,
+                                noise_voltage=0.001,
+                                noise_current=0.005,
+                                noise_temperature=0.5,
+                            )
+                            
+                            # Publish summary to MQTT
+                            mqtt_data = {
+                                "cell_id": i + 1,
+                                "chemistry": chemistry,
+                                "capacity": cell_params["capacity"],
+                                "temperature": cell_params["temperature"],
+                                "cycles_completed": results.cycles_completed,
+                                "capacity_retention": results.capacity_retention,
+                                "timestamp": datetime.now().isoformat(),
+                            }
+                            
+                            publish_to_mqtt(
+                                mqtt_data,
+                                mqtt_broker,
+                                mqtt_port,
+                                mqtt_topic,
+                                mqtt_username if mqtt_username else None,
+                                mqtt_password if mqtt_password else None,
+                            )
+                            
+                            Path(output_path).unlink(missing_ok=True)
+                            
+                        except Exception as e:
+                            st.warning(f"Cell {i+1} failed: {e}")
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("MQTT publishing complete!")
+                    st.success(f"Published {num_cells} cell datasets to MQTT topic: {mqtt_topic}")
+        
+        else:  # Scheduled Generation
+            st.session_state["generator_running"] = True
+            st.info(f"Scheduled generator started. Will generate every {export_frequency.lower()}.")
+            st.warning("Note: In Streamlit, scheduled tasks won't persist after page reload. For production use, consider a separate background service.")
+
+
+# =============================================================================
+# Main Application
+# =============================================================================
+
+def main():
+    """Main Streamlit application with navigation."""
+    
+    # Navigation
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio(
+        "Select Mode",
+        options=["Single Simulation", "Automated Generator"],
+        index=0,
+    )
+    
+    st.sidebar.markdown("---")
+    
+    if page == "Single Simulation":
+        page_single_simulation()
+    else:
+        page_automated_generator()
     
     # Footer
     st.markdown("---")
@@ -799,7 +1162,7 @@ def main():
         """
         <div style="text-align: center; opacity: 0.7; font-size: 0.9rem;">
             Battery Test Data Simulator v1.0.0 | 
-            <a href="https://github.com/your-org/BatterySimulator" target="_blank" class="footer-link">GitHub</a> |
+            <a href="https://github.com/arunnath011/BatterySimulator" target="_blank" class="footer-link">GitHub</a> |
             Built with Streamlit
         </div>
         """,
