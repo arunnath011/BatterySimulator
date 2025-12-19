@@ -1,0 +1,49 @@
+# Cycle Life Test Configuration
+# ==============================
+# Standard cycling test for battery degradation evaluation
+
+simulation:
+  name: "NMC811 1C Cycle Life Test"
+  output_dir: "./output/cycle_life"
+  timing_mode: "instant"
+  data_rate: 1.0  # Hz
+
+cell:
+  chemistry: "NMC811"
+  capacity: 3.0  # Ah
+  form_factor: "cylindrical"
+
+test_protocol:
+  type: "cycle_life"
+  cycles: 1000
+  temperature: 25  # °C
+
+  cycling:
+    charge_rate: 1.0      # 1C charge
+    discharge_rate: 1.0   # 1C discharge
+    voltage_max: 4.2      # V
+    voltage_min: 3.0      # V
+    rest_time: 300        # 5 minutes
+
+  rpt_interval: 50        # RPT every 50 cycles
+
+  end_conditions:
+    capacity_retention: 0.80  # Stop at 80%
+    max_cycles: 1000
+
+output:
+  format: "arbin"
+  cycle_data: true
+  summary_data: true
+  metadata: true
+
+degradation:
+  enable_capacity_fade: true
+  enable_resistance_growth: true
+  enable_sudden_failure: false
+
+noise:
+  voltage_noise: 0.001  # V
+  current_noise: 0.005  # A
+  temperature_noise: 0.5  # °C
+

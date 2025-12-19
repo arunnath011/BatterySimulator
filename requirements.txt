@@ -1,0 +1,29 @@
+# Battery Test Data Simulator - Requirements
+# ==========================================
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+numpy>=1.21.0
+pandas>=2.0.0
+scipy>=1.7.0
+pyyaml>=6.0
+pydantic>=2.0.0
+
+# CLI
+click>=8.0.0
+tqdm>=4.62.0
+
+# Visualization
+matplotlib>=3.4.0
+plotly>=5.18.0
+
+# Web App (requires Python 3.10+)
+# Uncomment if using Python 3.10+
+# streamlit>=1.28.0
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+black>=23.0.0
+ruff>=0.1.0
+
