@@ -876,8 +876,48 @@ def page_single_simulation():
             "pack": f"Pack ({pack_config['series'] if pack_config else 1}s{pack_config['parallel'] if pack_config else 1}p)",
         }.get(simulation_mode, "Fast")
         
-        with st.spinner(f"Running {mode_label} simulation... This may take a moment."):
+        # Get cycle count for progress tracking
+        total_cycles = protocol_params.get("cycles", 10)
+        
+        # Show detailed progress for high-fidelity and pack modes
+        if simulation_mode in ["high_fidelity", "pack"]:
+            # Create progress UI elements
+            st.markdown("---")
+            st.subheader("Simulation Progress")
+            
+            # Info box about expected duration
+            if simulation_mode == "high_fidelity":
+                model_speed = {"SPM": "fast", "SPMe": "medium", "DFN": "slow"}.get(pybamm_model, "medium")
+                st.info(f"""
+                **High-Fidelity Simulation Started**
+                - Model: {pybamm_model} ({model_speed} speed)
+                - Chemistry: {chemistry}
+                - Cycles: {total_cycles}
+                - PyBaMM simulations are more accurate but slower than fast mode.
+                - Estimated time: {total_cycles * (1 if model_speed == 'fast' else 3 if model_speed == 'medium' else 10)} - {total_cycles * (3 if model_speed == 'fast' else 10 if model_speed == 'medium' else 30)} seconds
+                """)
+            else:
+                pack_cells = (pack_config.get('series', 1) * pack_config.get('parallel', 1)) if pack_config else 1
+                st.info(f"""
+                **Pack Simulation Started**
+                - Pack Configuration: {pack_config.get('series', 1)}s{pack_config.get('parallel', 1)}p ({pack_cells} cells)
+                - Chemistry: {chemistry}
+                - Cycles: {total_cycles}
+                - Pack simulations model each cell individually.
+                """)
+            
+            progress_bar = st.progress(0, text="Initializing simulation...")
+            status_text = st.empty()
+            metrics_container = st.empty()
+            
+            # Update progress during initialization
+            progress_bar.progress(5, text="Loading PyBaMM model and parameters...")
+            
             try:
+                # Update progress
+                progress_bar.progress(10, text=f"Starting {mode_label} simulation...")
+                status_text.text(f"Running {total_cycles} cycles with {pybamm_model if simulation_mode == 'high_fidelity' else 'pack'} model...")
+                
                 results, df, output_path = run_simulation(
                     chemistry=chemistry,
                     capacity=capacity,
@@ -894,6 +934,20 @@ def page_single_simulation():
                     pack_config=pack_config,
                 )
                 
+                # Complete progress
+                progress_bar.progress(100, text="Simulation complete!")
+                status_text.text(f"Completed {results.cycles_completed} cycles successfully.")
+                
+                # Show quick metrics
+                with metrics_container.container():
+                    mc1, mc2, mc3 = st.columns(3)
+                    with mc1:
+                        st.metric("Cycles Done", results.cycles_completed)
+                    with mc2:
+                        st.metric("Capacity Retention", f"{results.capacity_retention:.1%}")
+                    with mc3:
+                        st.metric("Duration", f"{(results.end_time - results.start_time).total_seconds():.1f}s")
+                
                 st.session_state["results"] = results
                 st.session_state["df"] = df
                 st.session_state["run_complete"] = True
@@ -904,8 +958,43 @@ def page_single_simulation():
                 Path(output_path).unlink(missing_ok=True)
                 
             except Exception as e:
+                progress_bar.progress(100, text="Simulation failed")
                 st.error(f"Simulation failed: {str(e)}")
+                status_text.text(f"Error: {str(e)}")
                 st.session_state["run_complete"] = False
+        
+        else:
+            # Fast mode - use simple spinner
+            with st.spinner(f"Running {mode_label} simulation... This may take a moment."):
+                try:
+                    results, df, output_path = run_simulation(
+                        chemistry=chemistry,
+                        capacity=capacity,
+                        protocol_type=protocol_type,
+                        protocol_params=protocol_params,
+                        output_format=output_format,
+                        enable_degradation=enable_degradation,
+                        noise_voltage=noise_voltage,
+                        noise_current=noise_current,
+                        noise_temperature=noise_temperature,
+                        simulation_mode=simulation_mode,
+                        pybamm_model=pybamm_model,
+                        pybamm_parameter_set=pybamm_parameter_set,
+                        pack_config=pack_config,
+                    )
+                    
+                    st.session_state["results"] = results
+                    st.session_state["df"] = df
+                    st.session_state["run_complete"] = True
+                    st.session_state["simulation_mode"] = simulation_mode
+                    
+                    st.success(f"Simulation completed successfully! (Mode: {mode_label})")
+                    
+                    Path(output_path).unlink(missing_ok=True)
+                    
+                except Exception as e:
+                    st.error(f"Simulation failed: {str(e)}")
+                    st.session_state["run_complete"] = False
     
     if st.session_state.get("run_complete", False):
         results = st.session_state["results"]
