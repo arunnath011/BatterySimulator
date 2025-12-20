@@ -4,7 +4,7 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT">
   <img src="https://img.shields.io/badge/version-1.1.0-orange.svg" alt="Version 1.1.0">
-  <img src="https://img.shields.io/badge/tests-82%20passed-brightgreen.svg" alt="Tests: 82 passed">
+  <img src="https://img.shields.io/badge/tests-93%20passed-brightgreen.svg" alt="Tests: 93 passed">
 </p>
 
 <p align="center">
@@ -76,13 +76,13 @@ pip install -r requirements.txt
 pip install -e .
 
 # Optional: Install high-fidelity simulation support
-pip install pybamm>=24.1
+pip install pybamm
 
-# Optional: Install pack simulation support
-pip install liionpack>=0.3
+# Optional: Install pack simulation support (requires PyBaMM)
+pip install pybamm liionpack
 
 # Optional: Install MQTT export support
-pip install paho-mqtt>=1.6.0
+pip install paho-mqtt
 ```
 
 ---
@@ -261,16 +261,23 @@ streamlit run battery_simulator/app.py --server.port 8502
 
 ### App Features
 
-#### 1. Chemistry Selection
+#### 1. Simulation Mode Selection
+- **Fast (Empirical)**: Quick simulations using lookup tables - always available
+- **High-Fidelity (PyBaMM)**: Physics-based models with SPM/SPMe/DFN options - requires PyBaMM
+- **Pack Simulation**: Multi-cell pack modeling - requires PyBaMM + liionpack
+- Unavailable modes are shown with "not installed" suffix
+- Detailed progress UI with estimated time for high-fidelity simulations
+
+#### 2. Chemistry Selection
 - Choose from 4 battery chemistries: **NMC811**, **LFP**, **NCA**, **LTO**
 - View detailed chemistry specifications (voltage range, capacity, energy density)
 - Chemistry parameters automatically adjust protocol defaults
 
-#### 2. Cell Configuration
+#### 3. Cell Configuration
 - **Capacity**: Set cell capacity (0.1 - 100 Ah)
 - **Temperature**: Set operating temperature (-20C to 60C)
 
-#### 3. Protocol Configuration
+#### 4. Protocol Configuration
 
 | Protocol | Available Parameters |
 |----------|---------------------|
@@ -279,17 +286,24 @@ streamlit run battery_simulator/app.py --server.port 8502
 | **Rate Capability** | Discharge Rates (list), Cycles per Rate, Charge Rate |
 | **RPT** | Charge/Discharge Rate, Pulse Current |
 
-#### 4. Output Settings
+#### 5. Output Settings
 - Select output format: Generic, Arbin, Neware, Biologic
 - Configure measurement noise levels
 - Enable/disable degradation modeling
 
-#### 5. Interactive Results Dashboard
+#### 6. Interactive Results Dashboard
 - **Summary Metrics**: Cycles, Capacity Retention, Energy Throughput, Resistance
 - **Degradation Charts**: Capacity retention and efficiency over cycles
 - **Cycle Details**: Voltage, Current, SOC, Temperature profiles
 - **Raw Data View**: Preview and explore the generated data
 - **Export Options**: Download CSV data, JSON metadata, cycle summaries
+
+#### 7. Automated Data Generator
+- Generate batch data for multiple cells with randomized parameters
+- Select multiple chemistries for varied datasets
+- Configure cell-to-cell variation percentage
+- Export to folder (CSV files) or MQTT broker
+- Scheduled generation mode for continuous data production
 
 ---
 
@@ -613,8 +627,10 @@ BatterySimulator/
 ├── config/
 │   └── examples/                # Example configuration files
 │
-├── tests/                       # Test suite (82 tests)
+├── tests/                       # Test suite (93 tests)
 │   ├── test_battery_model.py
+│   ├── test_chemistry.py
+│   ├── test_degradation.py
 │   ├── test_protocols.py
 │   ├── test_simulator.py
 │   ├── test_pybamm_integration.py  # PyBaMM/pack integration tests
@@ -765,13 +781,19 @@ sim = BatterySimulator(chemistry="NMC811", mode=SimulationMode.FAST)
 
 ### High-Fidelity Mode (PyBaMM)
 
-Uses PyBaMM's physics-based electrochemical models for accurate simulations:
+Uses PyBaMM's physics-based electrochemical models for accurate simulations. The model extracts accurate OCV curves and parameters from PyBaMM during initialization, then uses optimized calculations for fast per-timestep updates.
 
 | Model | Description | Speed | Accuracy |
 |-------|-------------|-------|----------|
 | SPM | Single Particle Model | Fastest | Good |
 | SPMe | SPM with Electrolyte | Balanced | Better |
 | DFN | Doyle-Fuller-Newman | Slowest | Best |
+
+**Key Features:**
+- Accurate OCV curves extracted from PyBaMM parameter sets
+- Fast simulation speed (comparable to empirical model)
+- Temperature-dependent resistance modeling
+- Concentration polarization effects
 
 ```python
 sim = BatterySimulator(
@@ -781,7 +803,7 @@ sim = BatterySimulator(
 )
 ```
 
-**Requires:** `pip install pybamm>=24.1`
+**Requires:** `pip install pybamm`
 
 ### Pack Simulation Mode
 
@@ -799,7 +821,7 @@ sim = BatterySimulator(
 )
 ```
 
-**Requires:** `pip install pybamm>=24.1 liionpack>=0.3`
+**Requires:** `pip install pybamm liionpack`
 
 ### Standard Pack Presets
 
