@@ -586,28 +586,44 @@ def page_single_simulation():
         st.header("Simulation Configuration")
         
         # Simulation Mode Selector
-        st.subheader("0. Simulation Mode")
+        st.subheader("1. Simulation Mode")
         
+        # Always show all modes, but indicate availability
         mode_options = ["Fast (Empirical)"]
         mode_values = ["fast"]
+        mode_disabled = [False]
         
+        # High-Fidelity mode
         if pybamm_available:
             mode_options.append("High-Fidelity (PyBaMM)")
-            mode_values.append("high_fidelity")
+        else:
+            mode_options.append("High-Fidelity (PyBaMM) - not installed")
+        mode_values.append("high_fidelity")
+        mode_disabled.append(not pybamm_available)
         
+        # Pack mode
         if liionpack_available:
             mode_options.append("Pack Simulation")
-            mode_values.append("pack")
+        else:
+            mode_options.append("Pack Simulation - not installed")
+        mode_values.append("pack")
+        mode_disabled.append(not liionpack_available)
         
         selected_mode_idx = st.selectbox(
             "Select Simulation Mode",
             options=range(len(mode_options)),
             format_func=lambda x: mode_options[x],
             index=0,
-            help="Fast: Quick empirical model. High-Fidelity: Physics-based PyBaMM. Pack: Multi-cell pack simulation.",
+            help="Fast: Quick empirical model. High-Fidelity: Physics-based PyBaMM (pip install pybamm). Pack: Multi-cell pack simulation (pip install liionpack).",
             key="sim_mode",
         )
-        simulation_mode = mode_values[selected_mode_idx]
+        
+        # Check if selected mode is available
+        if mode_disabled[selected_mode_idx]:
+            st.warning(f"Selected mode requires additional packages. Using Fast mode instead.")
+            simulation_mode = "fast"
+        else:
+            simulation_mode = mode_values[selected_mode_idx]
         
         # Mode-specific settings
         pybamm_model = "SPMe"
@@ -695,7 +711,7 @@ def page_single_simulation():
         
         st.markdown("---")
         
-        st.subheader("1. Battery Chemistry")
+        st.subheader("2. Battery Chemistry")
         chemistry = st.selectbox(
             "Select Chemistry",
             options=["NMC811", "LFP", "NCA", "LTO"],
@@ -716,7 +732,7 @@ def page_single_simulation():
                 st.metric("Max Charge Rate", f"{chem_info['max_charge_rate']}C")
                 st.metric("Max Discharge Rate", f"{chem_info['max_discharge_rate']}C")
         
-        st.subheader("2. Cell Parameters")
+        st.subheader("3. Cell Parameters")
         capacity = st.number_input(
             "Capacity (Ah)",
             min_value=0.1,
@@ -737,7 +753,7 @@ def page_single_simulation():
             key="single_temperature",
         )
         
-        st.subheader("3. Test Protocol")
+        st.subheader("4. Test Protocol")
         protocol_type = st.selectbox(
             "Select Protocol",
             options=["Cycle Life", "Formation", "Rate Capability", "RPT"],
@@ -823,7 +839,7 @@ def page_single_simulation():
                 )
                 protocol_params["cycles"] = 1
         
-        st.subheader("4. Output Settings")
+        st.subheader("5. Output Settings")
         output_format = st.selectbox(
             "Output Format",
             options=["Generic", "Arbin", "Neware", "Biologic"],
