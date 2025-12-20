@@ -21,9 +21,27 @@ plotly>=5.18.0
 # Uncomment if using Python 3.10+
 # streamlit>=1.28.0
 
+# ===========================================
+# Optional: High-Fidelity Simulation (PyBaMM)
+# ===========================================
+# For physics-based electrochemical models (SPM, SPMe, DFN)
+# pip install pybamm>=24.1
+
+# ===========================================
+# Optional: Pack Simulation (liionpack)
+# ===========================================
+# For multi-cell pack simulations with series/parallel configurations
+# Requires PyBaMM
+# pip install liionpack>=0.3
+
+# ===========================================
+# Optional: MQTT Export
+# ===========================================
+# For real-time data streaming to MQTT brokers
+# pip install paho-mqtt>=1.6.0
+
 # Development dependencies
 pytest>=7.0.0
 pytest-cov>=4.0.0
 black>=23.0.0
 ruff>=0.1.0
-

@@ -1,5 +1,7 @@
 """Battery chemistry configurations."""
 
+from typing import List, Optional, Union
+
 from battery_simulator.chemistry.base_chemistry import BaseChemistry
 from battery_simulator.chemistry.nmc811 import NMC811Chemistry
 from battery_simulator.chemistry.lfp import LFPChemistry
@@ -45,11 +47,54 @@ class Chemistry:
             available = list(cls._registry.keys())
             raise ValueError(f"Unknown chemistry '{name}'. Available: {available}")
         return cls._registry[name_upper]()
+    
+    @classmethod
+    def from_pybamm(
+        cls, 
+        parameter_set: str,
+        capacity: Optional[float] = None,
+    ) -> BaseChemistry:
+        """
+        Create chemistry configuration from PyBaMM parameter set.
+        
+        Args:
+            parameter_set: PyBaMM parameter set name (e.g., 'Chen2020', 'Prada2013')
+            capacity: Optional capacity override in Ah
+            
+        Returns:
+            Chemistry configuration object
+            
+        Raises:
+            ImportError: If PyBaMM is not installed
+            ValueError: If parameter set is not found
+        """
+        from battery_simulator.chemistry.pybamm_params import PyBaMMParameterBridge
+        
+        bridge = PyBaMMParameterBridge()
+        return bridge.create_chemistry_from_pybamm(parameter_set, capacity)
 
     @classmethod
-    def list_available(cls) -> list[str]:
+    def list_available(cls) -> List[str]:
         """List available chemistry names."""
         return list(set(cls._registry.values()))
+    
+    @classmethod
+    def list_pybamm_available(cls) -> List[str]:
+        """
+        List available PyBaMM parameter sets.
+        
+        Returns:
+            List of available PyBaMM parameter set names
+        """
+        try:
+            from battery_simulator.chemistry.pybamm_params import (
+                PyBaMMParameterBridge
+            )
+            bridge = PyBaMMParameterBridge()
+            sets = bridge.list_parameter_sets()
+            return [s.name for s in sets if s.available]
+        except ImportError:
+            return []
 
     @classmethod
     def register(cls, name: str, chemistry_class: type) -> None:

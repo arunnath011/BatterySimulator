@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,44 @@ import streamlit as st
 
 from battery_simulator import BatterySimulator, Protocol
 from battery_simulator.chemistry import Chemistry
-from battery_simulator.core.simulator import SimulationConfig, TimingMode
+from battery_simulator.core.simulator import SimulationConfig, TimingMode, SimulationMode
+
+
+# Check for optional dependencies
+def check_pybamm_available() -> bool:
+    """Check if PyBaMM is installed."""
+    try:
+        from battery_simulator.core.pybamm_model import PYBAMM_AVAILABLE
+        return PYBAMM_AVAILABLE
+    except ImportError:
+        return False
+
+
+def check_liionpack_available() -> bool:
+    """Check if liionpack is installed."""
+    try:
+        from battery_simulator.core.pack_simulator import LIIONPACK_AVAILABLE
+        return LIIONPACK_AVAILABLE
+    except ImportError:
+        return False
+
+
+def get_pybamm_parameter_sets() -> List[Dict[str, Any]]:
+    """Get available PyBaMM parameter sets."""
+    try:
+        from battery_simulator.chemistry.pybamm_params import list_available_pybamm_chemistries
+        return list_available_pybamm_chemistries()
+    except ImportError:
+        return []
+
+
+def get_standard_packs() -> List[Dict[str, Any]]:
+    """Get standard pack configurations."""
+    try:
+        from battery_simulator.chemistry.pack_config import list_standard_packs
+        return list_standard_packs()
+    except ImportError:
+        return []
 
 
 # =============================================================================
@@ -326,8 +363,20 @@ def run_simulation(
     noise_current: float,
     noise_temperature: float,
     output_path: str | None = None,
+    simulation_mode: str = "fast",
+    pybamm_model: str = "SPMe",
+    pybamm_parameter_set: str | None = None,
+    pack_config: dict | None = None,
 ) -> tuple[Any, pd.DataFrame, str]:
     """Run the battery simulation with given parameters."""
+    
+    # Map mode string to enum
+    mode_map = {
+        "fast": SimulationMode.FAST,
+        "high_fidelity": SimulationMode.HIGH_FIDELITY,
+        "pack": SimulationMode.PACK,
+    }
+    mode = mode_map.get(simulation_mode, SimulationMode.FAST)
     
     config = SimulationConfig(
         timing_mode=TimingMode.INSTANT,
@@ -335,6 +384,10 @@ def run_simulation(
         noise_voltage=noise_voltage,
         noise_current=noise_current,
         noise_temperature=noise_temperature,
+        simulation_mode=mode,
+        pybamm_model=pybamm_model,
+        pybamm_parameter_set=pybamm_parameter_set,
+        pack_config=pack_config,
     )
     
     sim = BatterySimulator(
@@ -525,8 +578,122 @@ def page_single_simulation():
         unsafe_allow_html=True
     )
     
+    # Check available backends
+    pybamm_available = check_pybamm_available()
+    liionpack_available = check_liionpack_available()
+    
     with st.sidebar:
         st.header("Simulation Configuration")
+        
+        # Simulation Mode Selector
+        st.subheader("0. Simulation Mode")
+        
+        mode_options = ["Fast (Empirical)"]
+        mode_values = ["fast"]
+        
+        if pybamm_available:
+            mode_options.append("High-Fidelity (PyBaMM)")
+            mode_values.append("high_fidelity")
+        
+        if liionpack_available:
+            mode_options.append("Pack Simulation")
+            mode_values.append("pack")
+        
+        selected_mode_idx = st.selectbox(
+            "Select Simulation Mode",
+            options=range(len(mode_options)),
+            format_func=lambda x: mode_options[x],
+            index=0,
+            help="Fast: Quick empirical model. High-Fidelity: Physics-based PyBaMM. Pack: Multi-cell pack simulation.",
+            key="sim_mode",
+        )
+        simulation_mode = mode_values[selected_mode_idx]
+        
+        # Mode-specific settings
+        pybamm_model = "SPMe"
+        pybamm_parameter_set = None
+        pack_config = None
+        
+        if simulation_mode == "high_fidelity":
+            with st.expander("PyBaMM Settings", expanded=True):
+                pybamm_model = st.selectbox(
+                    "Electrochemical Model",
+                    options=["SPM", "SPMe", "DFN"],
+                    index=1,
+                    help="SPM: Fastest. SPMe: Balanced. DFN: Most accurate.",
+                    key="pybamm_model",
+                )
+                
+                param_sets = get_pybamm_parameter_sets()
+                if param_sets:
+                    param_names = ["Auto-detect"] + [p["name"] for p in param_sets]
+                    selected_param = st.selectbox(
+                        "Parameter Set",
+                        options=param_names,
+                        index=0,
+                        help="Choose a validated PyBaMM parameter set or auto-detect from chemistry.",
+                        key="pybamm_params",
+                    )
+                    if selected_param != "Auto-detect":
+                        pybamm_parameter_set = selected_param
+                
+                st.info("High-fidelity mode uses physics-based models for more accurate simulations.")
+        
+        elif simulation_mode == "pack":
+            with st.expander("Pack Configuration", expanded=True):
+                # Standard pack presets
+                std_packs = get_standard_packs()
+                pack_names = ["Custom"] + [p["name"] for p in std_packs]
+                
+                selected_pack_preset = st.selectbox(
+                    "Pack Preset",
+                    options=pack_names,
+                    index=0,
+                    key="pack_preset",
+                )
+                
+                if selected_pack_preset == "Custom":
+                    pack_series = st.number_input(
+                        "Cells in Series (Ns)",
+                        min_value=1,
+                        max_value=200,
+                        value=14,
+                        key="pack_series",
+                    )
+                    pack_parallel = st.number_input(
+                        "Cells in Parallel (Np)",
+                        min_value=1,
+                        max_value=50,
+                        value=4,
+                        key="pack_parallel",
+                    )
+                    pack_variation = st.slider(
+                        "Cell-to-Cell Variation (%)",
+                        min_value=0,
+                        max_value=10,
+                        value=2,
+                        key="pack_variation",
+                    ) / 100.0
+                else:
+                    # Get preset values
+                    preset = next((p for p in std_packs if p["name"] == selected_pack_preset), None)
+                    if preset:
+                        pack_series = preset["topology"]["series"]
+                        pack_parallel = preset["topology"]["parallel"]
+                        st.write(f"Series: {pack_series}, Parallel: {pack_parallel}")
+                        st.write(f"Total cells: {preset['topology']['total_cells']}")
+                        st.write(f"Energy: {preset['electrical']['energy_kwh']:.2f} kWh")
+                    pack_variation = 0.02
+                
+                pack_config = {
+                    "series": pack_series,
+                    "parallel": pack_parallel,
+                    "cell_variation": pack_variation,
+                }
+                
+                st.info(f"Pack: {pack_series}s{pack_parallel}p ({pack_series * pack_parallel} cells)")
+        
+        st.markdown("---")
         
         st.subheader("1. Battery Chemistry")
         chemistry = st.selectbox(
@@ -687,7 +854,13 @@ def page_single_simulation():
         run_button = st.button("Run Simulation", type="primary", use_container_width=True)
     
     if run_button:
-        with st.spinner("Running simulation... This may take a moment."):
+        mode_label = {
+            "fast": "Fast empirical",
+            "high_fidelity": f"PyBaMM ({pybamm_model})",
+            "pack": f"Pack ({pack_config['series'] if pack_config else 1}s{pack_config['parallel'] if pack_config else 1}p)",
+        }.get(simulation_mode, "Fast")
+        
+        with st.spinner(f"Running {mode_label} simulation... This may take a moment."):
             try:
                 results, df, output_path = run_simulation(
                     chemistry=chemistry,
@@ -699,13 +872,18 @@ def page_single_simulation():
                     noise_voltage=noise_voltage,
                     noise_current=noise_current,
                     noise_temperature=noise_temperature,
+                    simulation_mode=simulation_mode,
+                    pybamm_model=pybamm_model,
+                    pybamm_parameter_set=pybamm_parameter_set,
+                    pack_config=pack_config,
                 )
                 
                 st.session_state["results"] = results
                 st.session_state["df"] = df
                 st.session_state["run_complete"] = True
+                st.session_state["simulation_mode"] = simulation_mode
                 
-                st.success("Simulation completed successfully!")
+                st.success(f"Simulation completed successfully! (Mode: {mode_label})")
                 
                 Path(output_path).unlink(missing_ok=True)
                 
@@ -716,9 +894,19 @@ def page_single_simulation():
     if st.session_state.get("run_complete", False):
         results = st.session_state["results"]
         df = st.session_state["df"]
+        sim_mode = st.session_state.get("simulation_mode", "fast")
         
         st.markdown("---")
         st.header("Simulation Results")
+        
+        # Show backend info
+        if hasattr(results, 'backend_info') and results.backend_info:
+            backend_type = results.backend_info.get("type", "fast")
+            if backend_type == "pybamm":
+                st.info(f"Simulated with PyBaMM ({results.backend_info.get('model', 'SPMe')})")
+            elif backend_type == "pack":
+                pack_cfg = results.backend_info.get("pack_config", {})
+                st.info(f"Pack simulation: {pack_cfg.get('series', 1)}s{pack_cfg.get('parallel', 1)}p")
         
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
@@ -1156,12 +1344,24 @@ def main():
     else:
         page_automated_generator()
     
-    # Footer
+    # Footer with backend status
     st.markdown("---")
+    
+    # Show backend availability
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.caption("Fast Mode: Available")
+    with col2:
+        pybamm_status = "Available" if check_pybamm_available() else "Not installed"
+        st.caption(f"PyBaMM: {pybamm_status}")
+    with col3:
+        liionpack_status = "Available" if check_liionpack_available() else "Not installed"
+        st.caption(f"liionpack: {liionpack_status}")
+    
     st.markdown(
         """
         <div style="text-align: center; opacity: 0.7; font-size: 0.9rem;">
-            Battery Test Data Simulator v1.0.0 | 
+            Battery Test Data Simulator v1.1.0 | 
             <a href="https://github.com/arunnath011/BatterySimulator" target="_blank" class="footer-link">GitHub</a> |
             Built with Streamlit
         </div>

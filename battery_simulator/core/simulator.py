@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,14 @@ class TimingMode(str, Enum):
     INSTANT = "instant"  # Generate entire test immediately
 
 
+class SimulationMode(str, Enum):
+    """Simulation fidelity modes."""
+
+    FAST = "fast"  # Fast empirical model (default, existing behavior)
+    HIGH_FIDELITY = "high_fidelity"  # PyBaMM-based physics model
+    PACK = "pack"  # Pack simulation with liionpack
+
+
 @dataclass
 class SimulationConfig:
     """Configuration for simulation run."""
@@ -44,7 +52,15 @@ class SimulationConfig:
     noise_voltage: float = 0.001  # V std dev
     noise_current: float = 0.005  # A std dev
     noise_temperature: float = 0.5  # °C std dev
-    random_seed: int | None = None
+    random_seed: Optional[int] = None
+    
+    # Simulation mode settings
+    simulation_mode: SimulationMode = SimulationMode.FAST
+    pybamm_model: str = "SPMe"  # SPM, SPMe, or DFN for high-fidelity mode
+    pybamm_parameter_set: Optional[str] = None  # PyBaMM parameter set name
+    
+    # Pack simulation settings
+    pack_config: Optional[Dict[str, Any]] = None  # {"series": 14, "parallel": 4}
 
 
 @dataclass
@@ -64,10 +80,12 @@ class SimulationResults:
     resistance_final: float
     energy_throughput: float
     equivalent_full_cycles: float
-    failure_mode: str | None = None
-    failure_cycle: int | None = None
+    failure_mode: Optional[str] = None
+    failure_cycle: Optional[int] = None
     cycle_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
-    data_file: str | None = None
+    data_file: Optional[str] = None
+    simulation_mode: str = "fast"
+    backend_info: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         """Convert results to dictionary."""
@@ -80,6 +98,8 @@ class SimulationResults:
                 "end_time": self.end_time.isoformat(),
                 "total_cycles": self.cycles_completed,
                 "data_file": self.data_file,
+                "simulation_mode": self.simulation_mode,
+                "backend_info": self.backend_info,
             },
             "results_summary": {
                 "cycles_completed": self.cycles_completed,
@@ -104,14 +124,22 @@ class BatterySimulator:
     - Thermal model (temperature evolution)
     - Protocol execution (charge, discharge, rest steps)
     - Data output (CSV, specific formats)
+    
+    Supports multiple simulation modes:
+    - FAST: Empirical model (default, fastest)
+    - HIGH_FIDELITY: PyBaMM physics-based models (SPM, SPMe, DFN)
+    - PACK: Pack-level simulation with liionpack
     """
 
     def __init__(
         self,
-        chemistry: BaseChemistry | str,
-        capacity: float | None = None,
+        chemistry: Union[BaseChemistry, str],
+        capacity: Optional[float] = None,
         temperature: float = 25.0,
-        config: SimulationConfig | None = None,
+        config: Optional[SimulationConfig] = None,
+        mode: Optional[SimulationMode] = None,
+        pybamm_model: Optional[str] = None,
+        pack_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the battery simulator.
@@ -121,25 +149,35 @@ class BatterySimulator:
             capacity: Nominal capacity in Ah (uses chemistry default if None)
             temperature: Initial temperature (°C)
             config: Simulation configuration
+            mode: Simulation mode (FAST, HIGH_FIDELITY, PACK) - overrides config
+            pybamm_model: PyBaMM model type (SPM, SPMe, DFN) - overrides config
+            pack_config: Pack configuration dict - overrides config
         """
+        self.config = config or SimulationConfig()
+        
+        # Handle mode overrides
+        if mode is not None:
+            self.config.simulation_mode = mode
+        if pybamm_model is not None:
+            self.config.pybamm_model = pybamm_model
+        if pack_config is not None:
+            self.config.pack_config = pack_config
+        
         # Handle chemistry by name
         if isinstance(chemistry, str):
+            self._chemistry_name = chemistry
             from battery_simulator.chemistry import Chemistry
-
             chemistry = Chemistry.from_name(chemistry)
+        else:
+            self._chemistry_name = getattr(chemistry, 'name', 'Unknown')
 
         self.chemistry = chemistry
-        self.config = config or SimulationConfig()
-
+        
         # Initialize random number generator
         self.rng = np.random.default_rng(self.config.random_seed)
-
-        # Initialize battery model
-        self.battery = BatteryModel(
-            chemistry=chemistry,
-            capacity=capacity,
-            temperature=temperature,
-        )
+        
+        # Initialize appropriate backend based on mode
+        self._init_backend(capacity, temperature)
 
         # Initialize degradation model
         self.degradation = DegradationModel(
@@ -171,6 +209,144 @@ class BatterySimulator:
         self._current_cycle = 0
         self._current_step = 0
         self._last_cycle_metrics: dict = {}
+    
+    def _init_backend(self, capacity: Optional[float], temperature: float) -> None:
+        """Initialize the appropriate simulation backend based on mode."""
+        mode = self.config.simulation_mode
+        
+        if mode == SimulationMode.FAST:
+            # Standard empirical model
+            self.battery = BatteryModel(
+                chemistry=self.chemistry,
+                capacity=capacity,
+                temperature=temperature,
+            )
+            self._backend_type = "fast"
+            
+        elif mode == SimulationMode.HIGH_FIDELITY:
+            # PyBaMM-based model
+            try:
+                from battery_simulator.core.pybamm_model import (
+                    PyBaMMModel, 
+                    PyBaMMModelType,
+                    PYBAMM_AVAILABLE
+                )
+                
+                if not PYBAMM_AVAILABLE:
+                    raise ImportError("PyBaMM not available")
+                
+                # Map model string to enum
+                model_map = {
+                    "SPM": PyBaMMModelType.SPM,
+                    "SPMe": PyBaMMModelType.SPME,
+                    "SPME": PyBaMMModelType.SPME,
+                    "DFN": PyBaMMModelType.DFN,
+                }
+                model_type = model_map.get(
+                    self.config.pybamm_model, PyBaMMModelType.SPME
+                )
+                
+                self.battery = PyBaMMModel(
+                    chemistry=self.chemistry,
+                    capacity=capacity,
+                    temperature=temperature,
+                    model_type=model_type,
+                    parameter_set=self.config.pybamm_parameter_set,
+                )
+                self._backend_type = "pybamm"
+                
+            except ImportError:
+                # Fallback to fast mode
+                import warnings
+                warnings.warn(
+                    "PyBaMM not available, falling back to fast empirical model. "
+                    "Install with: pip install pybamm"
+                )
+                self.battery = BatteryModel(
+                    chemistry=self.chemistry,
+                    capacity=capacity,
+                    temperature=temperature,
+                )
+                self._backend_type = "fast"
+                self.config.simulation_mode = SimulationMode.FAST
+                
+        elif mode == SimulationMode.PACK:
+            # Pack simulation with liionpack
+            try:
+                from battery_simulator.core.pack_simulator import (
+                    PackSimulator,
+                    LIIONPACK_AVAILABLE
+                )
+                
+                if not LIIONPACK_AVAILABLE:
+                    raise ImportError("liionpack not available")
+                
+                pack_cfg = self.config.pack_config or {"series": 1, "parallel": 1}
+                
+                self.battery = PackSimulator(
+                    chemistry=self.chemistry,
+                    capacity=capacity,
+                    temperature=temperature,
+                    series=pack_cfg.get("series", 1),
+                    parallel=pack_cfg.get("parallel", 1),
+                    cell_variation=pack_cfg.get("cell_variation", 0.02),
+                )
+                self._backend_type = "pack"
+                
+            except ImportError:
+                # Fallback to fast mode
+                import warnings
+                warnings.warn(
+                    "liionpack not available, falling back to fast empirical model. "
+                    "Install with: pip install liionpack"
+                )
+                self.battery = BatteryModel(
+                    chemistry=self.chemistry,
+                    capacity=capacity,
+                    temperature=temperature,
+                )
+                self._backend_type = "fast"
+                self.config.simulation_mode = SimulationMode.FAST
+        else:
+            # Default to fast model
+            self.battery = BatteryModel(
+                chemistry=self.chemistry,
+                capacity=capacity,
+                temperature=temperature,
+            )
+            self._backend_type = "fast"
+    
+    @property
+    def backend_type(self) -> str:
+        """Get the currently active backend type."""
+        return self._backend_type
+    
+    @classmethod
+    def check_backend_available(cls, mode: SimulationMode) -> bool:
+        """
+        Check if a specific backend is available.
+        
+        Args:
+            mode: Simulation mode to check
+            
+        Returns:
+            True if the backend is available
+        """
+        if mode == SimulationMode.FAST:
+            return True
+        elif mode == SimulationMode.HIGH_FIDELITY:
+            try:
+                from battery_simulator.core.pybamm_model import PYBAMM_AVAILABLE
+                return PYBAMM_AVAILABLE
+            except ImportError:
+                return False
+        elif mode == SimulationMode.PACK:
+            try:
+                from battery_simulator.core.pack_simulator import LIIONPACK_AVAILABLE
+                return LIIONPACK_AVAILABLE
+            except ImportError:
+                return False
+        return False
 
     def set_temperature_profile(self, profile: TemperatureProfile) -> None:
         """Set ambient temperature profile."""
@@ -269,6 +445,16 @@ class BatterySimulator:
         if writer:
             writer.close()
 
+        # Build backend info
+        backend_info = {
+            "type": self._backend_type,
+        }
+        if self._backend_type == "pybamm":
+            backend_info["model"] = self.config.pybamm_model
+            backend_info["parameter_set"] = self.config.pybamm_parameter_set
+        elif self._backend_type == "pack":
+            backend_info["pack_config"] = self.config.pack_config
+        
         # Build results
         results = SimulationResults(
             test_id=f"SIM-{start_time.strftime('%Y%m%d-%H%M%S')}",
@@ -288,6 +474,8 @@ class BatterySimulator:
             failure_cycle=self.failure.failure_cycle,
             cycle_summary=pd.DataFrame(self._cycle_summary),
             data_file=str(output_path) if output_path else None,
+            simulation_mode=self.config.simulation_mode.value,
+            backend_info=backend_info,
         )
 
         return results

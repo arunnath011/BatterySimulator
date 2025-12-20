@@ -3,8 +3,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python 3.9+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT">
-  <img src="https://img.shields.io/badge/version-1.0.0-orange.svg" alt="Version 1.0.0">
-  <img src="https://img.shields.io/badge/tests-64%20passed-brightgreen.svg" alt="Tests: 64 passed">
+  <img src="https://img.shields.io/badge/version-1.1.0-orange.svg" alt="Version 1.1.0">
+  <img src="https://img.shields.io/badge/tests-82%20passed-brightgreen.svg" alt="Tests: 82 passed">
 </p>
 
 <p align="center">
@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  The simulator produces CSV output files mimicking real battery cycler formats (Arbin, Neware, Biologic) with physics-based electrochemical modeling and semi-empirical degradation models.
+  The simulator produces CSV output files mimicking real battery cycler formats (Arbin, Neware, Biologic) with physics-based electrochemical modeling, semi-empirical degradation models, and optional PyBaMM integration for high-fidelity simulations.
 </p>
 
 ---
@@ -30,6 +30,9 @@
 | **CLI + Python API** | Full command-line interface and programmatic access |
 | **Web Interface** | Interactive Streamlit app for easy simulation setup and visualization |
 | **Realistic Noise** | Configurable measurement noise for voltage, current, temperature |
+| **PyBaMM Integration** | Optional high-fidelity physics-based models (SPM, SPMe, DFN) |
+| **Pack Simulation** | Multi-cell pack simulations with liionpack (series/parallel configurations) |
+| **Automated Generator** | Batch data generation with randomized parameters and MQTT export |
 
 ---
 
@@ -42,8 +45,14 @@
 git clone https://github.com/your-org/BatterySimulator.git
 cd BatterySimulator
 
-# Install with Poetry
+# Install with Poetry (core dependencies)
 poetry install
+
+# Install with optional features
+poetry install --extras webapp     # Streamlit web app
+poetry install --extras pybamm     # High-fidelity PyBaMM models
+poetry install --extras pack       # Pack simulation (includes PyBaMM + liionpack)
+poetry install --extras all        # All optional features
 
 # Activate the virtual environment
 poetry shell
@@ -65,6 +74,15 @@ pip install -r requirements.txt
 
 # Install package in development mode
 pip install -e .
+
+# Optional: Install high-fidelity simulation support
+pip install pybamm>=24.1
+
+# Optional: Install pack simulation support
+pip install liionpack>=0.3
+
+# Optional: Install MQTT export support
+pip install paho-mqtt>=1.6.0
 ```
 
 ---
@@ -119,8 +137,9 @@ battery-simulator init-config --output config/my_config.yaml
 
 ```python
 from battery_simulator import BatterySimulator, Protocol
+from battery_simulator.core.simulator import SimulationMode
 
-# Create simulator with NMC811 chemistry
+# Create simulator with NMC811 chemistry (Fast empirical mode - default)
 sim = BatterySimulator(
     chemistry="NMC811",
     capacity=3.0,      # Ah
@@ -148,6 +167,63 @@ results = sim.run(
 # Access results
 print(f"Test ID: {results.test_id}")
 print(f"Cycles Completed: {results.cycles_completed}")
+print(f"Simulation Mode: {results.simulation_mode}")
+```
+
+### High-Fidelity Mode (PyBaMM)
+
+```python
+from battery_simulator import BatterySimulator, Protocol
+from battery_simulator.core.simulator import SimulationMode
+
+# High-fidelity mode with PyBaMM physics-based models
+sim_hifi = BatterySimulator(
+    chemistry="NMC811",  # Or use PyBaMM parameter set: "Chen2020"
+    mode=SimulationMode.HIGH_FIDELITY,
+    pybamm_model="SPMe",  # SPM (fastest), SPMe (balanced), DFN (most accurate)
+)
+
+protocol = Protocol.cycle_life(cycles=100)
+results = sim_hifi.run(protocol)
+
+print(f"Backend: {results.backend_info}")  # Shows PyBaMM model used
+```
+
+### Pack Simulation Mode
+
+```python
+from battery_simulator import BatterySimulator, Protocol
+from battery_simulator.core.simulator import SimulationMode
+
+# Pack simulation with liionpack
+sim_pack = BatterySimulator(
+    chemistry="NMC811",
+    mode=SimulationMode.PACK,
+    pack_config={
+        "series": 14,      # 14 cells in series (~50V)
+        "parallel": 4,      # 4 parallel strings
+        "cell_variation": 0.02,  # 2% cell-to-cell variation
+    }
+)
+
+protocol = Protocol.cycle_life(cycles=50)
+results = sim_pack.run(protocol)
+
+print(f"Pack: {results.backend_info['pack_config']}")
+```
+
+### Using PyBaMM Parameter Sets
+
+```python
+from battery_simulator.chemistry import Chemistry
+
+# List available PyBaMM parameter sets
+pybamm_sets = Chemistry.list_pybamm_available()
+print(f"Available: {pybamm_sets}")
+
+# Create chemistry from PyBaMM parameters
+chem = Chemistry.from_pybamm("Chen2020")  # LG M50 NMC811 cell
+print(f"Chemistry: {chem.name}, Capacity: {chem.nominal_capacity} Ah")
 print(f"Capacity Retention: {results.capacity_retention:.2%}")
 print(f"Energy Throughput: {results.energy_throughput:.1f} Wh")
 ```
@@ -498,8 +574,10 @@ BatterySimulator/
 │   ├── app.py                   # Streamlit web application
 │   │
 │   ├── core/
-│   │   ├── simulator.py         # Main simulator orchestrator
-│   │   ├── battery_model.py     # Physics-based battery model
+│   │   ├── simulator.py         # Main simulator orchestrator + SimulationMode
+│   │   ├── battery_model.py     # Fast empirical battery model
+│   │   ├── pybamm_model.py      # PyBaMM high-fidelity model wrapper
+│   │   ├── pack_simulator.py    # liionpack pack simulation
 │   │   ├── degradation.py       # Semi-empirical Arrhenius degradation
 │   │   └── thermal_model.py     # Temperature modeling
 │   │
@@ -508,7 +586,9 @@ BatterySimulator/
 │   │   ├── nmc811.py            # NMC811/Graphite parameters
 │   │   ├── lfp.py               # LFP/Graphite parameters
 │   │   ├── nca.py               # NCA/Si-Graphite parameters
-│   │   └── lto.py               # LTO/LMO parameters
+│   │   ├── lto.py               # LTO/LMO parameters
+│   │   ├── pybamm_params.py     # PyBaMM parameter library bridge
+│   │   └── pack_config.py       # Pack topology configurations
 │   │
 │   ├── protocols/
 │   │   ├── base_protocol.py     # Protocol base classes & steps
@@ -533,10 +613,11 @@ BatterySimulator/
 ├── config/
 │   └── examples/                # Example configuration files
 │
-├── tests/                       # Test suite (64 tests)
+├── tests/                       # Test suite (82 tests)
 │   ├── test_battery_model.py
 │   ├── test_protocols.py
 │   ├── test_simulator.py
+│   ├── test_pybamm_integration.py  # PyBaMM/pack integration tests
 │   └── test_app.py              # Streamlit app component tests
 │
 ├── pyproject.toml               # Poetry configuration
@@ -660,6 +741,110 @@ sim.on_data(on_data_point)
 # Run with streaming
 protocol = Protocol.cycle_life(cycles=10)
 sim.run(protocol=protocol, output_path="streaming_test.csv")
+```
+
+---
+
+## Simulation Modes
+
+The simulator supports three simulation modes, allowing you to trade off between speed and accuracy:
+
+### Fast Mode (Default)
+
+The fast empirical model uses lookup tables and simplified physics for rapid simulation. Ideal for:
+- ML training data generation
+- Quick prototyping
+- Large-scale simulations (1000+ cycles)
+
+```python
+from battery_simulator import BatterySimulator
+from battery_simulator.core.simulator import SimulationMode
+
+sim = BatterySimulator(chemistry="NMC811", mode=SimulationMode.FAST)
+```
+
+### High-Fidelity Mode (PyBaMM)
+
+Uses PyBaMM's physics-based electrochemical models for accurate simulations:
+
+| Model | Description | Speed | Accuracy |
+|-------|-------------|-------|----------|
+| SPM | Single Particle Model | Fastest | Good |
+| SPMe | SPM with Electrolyte | Balanced | Better |
+| DFN | Doyle-Fuller-Newman | Slowest | Best |
+
+```python
+sim = BatterySimulator(
+    chemistry="NMC811",
+    mode=SimulationMode.HIGH_FIDELITY,
+    pybamm_model="SPMe"  # or "SPM", "DFN"
+)
+```
+
+**Requires:** `pip install pybamm>=24.1`
+
+### Pack Simulation Mode
+
+Multi-cell pack simulations using liionpack with:
+- Series/parallel configurations
+- Cell-to-cell variation
+- Thermal coupling between cells
+- Individual cell monitoring
+
+```python
+sim = BatterySimulator(
+    chemistry="NMC811",
+    mode=SimulationMode.PACK,
+    pack_config={"series": 14, "parallel": 4}
+)
+```
+
+**Requires:** `pip install pybamm>=24.1 liionpack>=0.3`
+
+### Standard Pack Presets
+
+Pre-configured pack topologies for common applications:
+
+| Preset | Configuration | Voltage | Energy |
+|--------|--------------|---------|--------|
+| `ev_small` | 96s2p | ~350V | ~35 kWh |
+| `ev_medium` | 108s4p | ~400V | ~80 kWh |
+| `ev_large` | 120s6p | ~450V | ~135 kWh |
+| `ess_module` | 14s4p | ~50V | ~28 kWh |
+| `ebike` | 13s4p | ~48V | ~0.7 kWh |
+| `power_tool` | 5s2p | ~20V | ~0.1 kWh |
+
+```python
+from battery_simulator.chemistry.pack_config import get_standard_pack
+
+pack_cfg = get_standard_pack("ev_medium")
+print(f"Pack: {pack_cfg.series}s{pack_cfg.parallel}p, {pack_cfg.pack_energy_kwh:.1f} kWh")
+```
+
+---
+
+## PyBaMM Parameter Library
+
+When using high-fidelity mode, you can access PyBaMM's extensive validated parameter library:
+
+| Parameter Set | Chemistry | Description |
+|--------------|-----------|-------------|
+| `Chen2020` | NMC811-Graphite | LG M50 21700 cell |
+| `Marquis2019` | NMC622-Graphite | Kokam pouch cell |
+| `Prada2013` | LFP-Graphite | A123 26650 cell |
+| `Ecker2015` | NMC532-Graphite | Kokam with aging |
+| `NCA_Kim2011` | NCA-Graphite | Generic NCA |
+| `Ramadass2004` | LCO-Graphite | Sony 18650 |
+
+```python
+from battery_simulator.chemistry import Chemistry
+
+# List available parameter sets
+sets = Chemistry.list_pybamm_available()
+print(f"Available: {sets}")
+
+# Create chemistry from PyBaMM parameters
+chem = Chemistry.from_pybamm("Chen2020")
 ```
 
 ---
