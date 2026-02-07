@@ -15,7 +15,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -24,9 +24,15 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from battery_simulator import BatterySimulator, Protocol
+from battery_simulator import BatterySimulator, Protocol, CycleResult
 from battery_simulator.chemistry import Chemistry
-from battery_simulator.core.simulator import SimulationConfig, TimingMode, SimulationMode
+from battery_simulator.core.simulator import (
+    SimulationConfig,
+    TimingMode,
+    SimulationMode,
+    StreamingMode,
+    StreamingConfig,
+)
 
 
 # Check for optional dependencies
@@ -239,6 +245,108 @@ def create_capacity_retention_chart(cycle_summary: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def create_degradation_component_chart(cycle_summary: pd.DataFrame) -> go.Figure:
+    """
+    Create a stacked area chart showing the three-component degradation breakdown.
+
+    Only available when the LFP paper model is active (columns
+    ``calendar_loss``, ``breakin_loss``, ``longterm_loss`` exist).
+    """
+    fig = go.Figure()
+
+    cycles = cycle_summary["cycle_index"]
+
+    fig.add_trace(go.Scatter(
+        x=cycles,
+        y=cycle_summary["calendar_loss"] * 100,
+        mode="lines",
+        name="Calendar Aging",
+        stackgroup="one",
+        line=dict(width=0.5, color="#636EFA"),
+        fillcolor="rgba(99,110,250,0.5)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=cycles,
+        y=cycle_summary["breakin_loss"] * 100,
+        mode="lines",
+        name="Cycling Break-in",
+        stackgroup="one",
+        line=dict(width=0.5, color="#EF553B"),
+        fillcolor="rgba(239,85,59,0.5)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=cycles,
+        y=cycle_summary["longterm_loss"] * 100,
+        mode="lines",
+        name="Long-term Cycling",
+        stackgroup="one",
+        line=dict(width=0.5, color="#00CC96"),
+        fillcolor="rgba(0,204,150,0.5)",
+    ))
+
+    fig.update_layout(
+        title="Degradation Component Breakdown (LFP Paper Model)",
+        xaxis_title="Cycle Number",
+        yaxis_title="Cumulative Capacity Loss (%)",
+        height=400,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        template=get_plotly_template(),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.2)")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(128,128,128,0.2)")
+    return fig
+
+
+def create_stress_heatmap(
+    param_func,
+    x_label: str,
+    y_label: str,
+    x_range: tuple,
+    y_range: tuple,
+    title: str,
+    n_points: int = 30,
+) -> go.Figure:
+    """
+    Create an interactive heatmap for stress-factor visualization.
+
+    Args:
+        param_func: Callable(x, y) → scalar stress value.
+        x_label / y_label: Axis labels.
+        x_range / y_range: (min, max) tuples for axes.
+        title: Chart title.
+        n_points: Grid resolution per axis.
+    """
+    import numpy as np
+
+    xs = np.linspace(x_range[0], x_range[1], n_points)
+    ys = np.linspace(y_range[0], y_range[1], n_points)
+    z = np.zeros((n_points, n_points))
+
+    for i, y in enumerate(ys):
+        for j, x in enumerate(xs):
+            z[i, j] = param_func(x, y)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=np.round(xs, 3),
+        y=np.round(ys, 3),
+        colorscale="YlOrRd",
+        colorbar=dict(title="Stress"),
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        height=420,
+        template=get_plotly_template(),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
 def create_efficiency_chart(cycle_summary: pd.DataFrame) -> go.Figure:
     """Create coulombic and energy efficiency chart."""
     fig = go.Figure()
@@ -367,6 +475,8 @@ def run_simulation(
     pybamm_model: str = "SPMe",
     pybamm_parameter_set: str | None = None,
     pack_config: dict | None = None,
+    streaming: bool = False,
+    on_cycle_complete: Callable[[CycleResult], None] | None = None,
 ) -> tuple[Any, pd.DataFrame, str]:
     """Run the battery simulation with given parameters."""
     
@@ -378,6 +488,12 @@ def run_simulation(
     }
     mode = mode_map.get(simulation_mode, SimulationMode.FAST)
     
+    # Configure streaming if enabled
+    streaming_config = StreamingConfig(
+        mode=StreamingMode.PER_CYCLE if streaming else StreamingMode.BATCH,
+        flush_after_cycle=True,
+    )
+    
     config = SimulationConfig(
         timing_mode=TimingMode.INSTANT,
         enable_degradation=enable_degradation,
@@ -388,6 +504,141 @@ def run_simulation(
         pybamm_model=pybamm_model,
         pybamm_parameter_set=pybamm_parameter_set,
         pack_config=pack_config,
+        streaming=streaming_config,
+    )
+    
+    sim = BatterySimulator(
+        chemistry=chemistry,
+        capacity=capacity,
+        temperature=protocol_params.get("temperature", 25.0),
+        config=config,
+    )
+    
+    # Register cycle callback if provided
+    if on_cycle_complete:
+        sim.on_cycle_complete(on_cycle_complete)
+    
+    if protocol_type == "Cycle Life":
+        protocol = Protocol.cycle_life(
+            charge_rate=protocol_params["charge_rate"],
+            discharge_rate=protocol_params["discharge_rate"],
+            cycles=protocol_params["cycles"],
+            voltage_max=protocol_params["voltage_max"],
+            voltage_min=protocol_params["voltage_min"],
+            rest_time=protocol_params["rest_time"],
+        )
+    elif protocol_type == "Formation":
+        protocol = Protocol.formation(
+            cycles=protocol_params["cycles"],
+            initial_rate=protocol_params["initial_rate"],
+            voltage_max=protocol_params["voltage_max"],
+            voltage_min=protocol_params["voltage_min"],
+        )
+    elif protocol_type == "Rate Capability":
+        protocol = Protocol.rate_capability(
+            rates=protocol_params["rates"],
+            cycles_per_rate=protocol_params["cycles_per_rate"],
+            charge_rate=protocol_params["charge_rate"],
+            voltage_max=protocol_params["voltage_max"],
+            voltage_min=protocol_params["voltage_min"],
+        )
+    elif protocol_type == "RPT":
+        protocol = Protocol.rpt(
+            charge_rate=protocol_params["charge_rate"],
+            discharge_rate=protocol_params["discharge_rate"],
+            pulse_current=protocol_params["pulse_current"],
+        )
+    else:
+        protocol = Protocol.cycle_life(cycles=protocol_params["cycles"])
+    
+    if output_path is None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            output_path = f.name
+    
+    # Use streaming mode if enabled
+    if streaming:
+        generator = sim.run_streaming(
+            protocol=protocol,
+            output_path=output_path,
+            output_format=output_format.lower(),
+            show_progress=False,
+        )
+        # Exhaust generator to complete simulation
+        try:
+            while True:
+                next(generator)
+        except StopIteration as e:
+            results = e.value
+        
+        if results is None:
+            results = sim.get_streaming_results()
+    else:
+        results = sim.run(
+            protocol=protocol,
+            output_path=output_path,
+            output_format=output_format.lower(),
+            show_progress=False,
+        )
+    
+    df = pd.read_csv(output_path)
+    
+    return results, df, output_path
+
+
+def run_simulation_streaming(
+    chemistry: str,
+    capacity: float,
+    protocol_type: str,
+    protocol_params: dict,
+    output_format: str,
+    enable_degradation: bool,
+    noise_voltage: float,
+    noise_current: float,
+    noise_temperature: float,
+    output_path: str | None = None,
+    simulation_mode: str = "fast",
+    pybamm_model: str = "SPMe",
+    pybamm_parameter_set: str | None = None,
+    pack_config: dict | None = None,
+) -> Generator[tuple[CycleResult, BatterySimulator], None, tuple[Any, pd.DataFrame, str]]:
+    """
+    Run simulation with streaming output - yields CycleResult after each cycle.
+    
+    This is a generator that yields (CycleResult, simulator) tuples after each cycle,
+    allowing for real-time progress updates in the UI.
+    
+    Yields:
+        tuple: (CycleResult, BatterySimulator) for each completed cycle
+        
+    Returns:
+        tuple: (results, df, output_path) when complete
+    """
+    from typing import Generator
+    
+    # Map mode string to enum
+    mode_map = {
+        "fast": SimulationMode.FAST,
+        "high_fidelity": SimulationMode.HIGH_FIDELITY,
+        "pack": SimulationMode.PACK,
+    }
+    mode = mode_map.get(simulation_mode, SimulationMode.FAST)
+    
+    streaming_config = StreamingConfig(
+        mode=StreamingMode.PER_CYCLE,
+        flush_after_cycle=True,
+    )
+    
+    config = SimulationConfig(
+        timing_mode=TimingMode.INSTANT,
+        enable_degradation=enable_degradation,
+        noise_voltage=noise_voltage,
+        noise_current=noise_current,
+        noise_temperature=noise_temperature,
+        simulation_mode=mode,
+        pybamm_model=pybamm_model,
+        pybamm_parameter_set=pybamm_parameter_set,
+        pack_config=pack_config,
+        streaming=streaming_config,
     )
     
     sim = BatterySimulator(
@@ -434,12 +685,24 @@ def run_simulation(
         with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
             output_path = f.name
     
-    results = sim.run(
+    # Run with streaming - yield each cycle result
+    generator = sim.run_streaming(
         protocol=protocol,
         output_path=output_path,
         output_format=output_format.lower(),
         show_progress=False,
     )
+    
+    results = None
+    try:
+        while True:
+            cycle_result = next(generator)
+            yield (cycle_result, sim)
+    except StopIteration as e:
+        results = e.value
+    
+    if results is None:
+        results = sim.get_streaming_results()
     
     df = pd.read_csv(output_path)
     
@@ -851,6 +1114,15 @@ def page_single_simulation():
             enable_degradation = st.checkbox(
                 "Enable Degradation", value=True, key="single_degradation",
             )
+            
+            st.markdown("**Streaming Mode**")
+            enable_streaming = st.checkbox(
+                "Enable Per-Cycle Streaming",
+                value=False,
+                key="single_streaming",
+                help="Output data after each cycle completes instead of waiting for all cycles",
+            )
+            
             st.markdown("**Measurement Noise (Std Dev)**")
             noise_voltage = st.number_input(
                 "Voltage Noise (V)", min_value=0.0, max_value=0.01, value=0.001,
@@ -964,10 +1236,20 @@ def page_single_simulation():
                 st.session_state["run_complete"] = False
         
         else:
-            # Fast mode - use simple spinner
-            with st.spinner(f"Running {mode_label} simulation... This may take a moment."):
+            # Fast mode - check if streaming is enabled
+            if enable_streaming:
+                # Streaming mode with per-cycle progress
+                st.markdown("---")
+                st.subheader("Simulation Progress (Streaming Mode)")
+                
+                total_cycles = protocol_params.get("cycles", 10)
+                progress_bar = st.progress(0, text="Starting simulation...")
+                cycle_status = st.empty()
+                metrics_cols = st.columns(4)
+                
                 try:
-                    results, df, output_path = run_simulation(
+                    # Use streaming generator
+                    streaming_gen = run_simulation_streaming(
                         chemistry=chemistry,
                         capacity=capacity,
                         protocol_type=protocol_type,
@@ -983,18 +1265,100 @@ def page_single_simulation():
                         pack_config=pack_config,
                     )
                     
+                    results = None
+                    output_path = None
+                    
+                    try:
+                        while True:
+                            cycle_result, sim = next(streaming_gen)
+                            
+                            # Update progress
+                            progress = cycle_result.cycle_index / total_cycles
+                            progress_bar.progress(
+                                progress, 
+                                text=f"Cycle {cycle_result.cycle_index}/{total_cycles} complete"
+                            )
+                            
+                            # Update status
+                            metrics = cycle_result.cumulative_metrics
+                            cycle_status.markdown(
+                                f"**Cycle {cycle_result.cycle_index}** completed - "
+                                f"Retention: {metrics['capacity_retention']:.2%}, "
+                                f"Energy: {metrics['total_energy']:.2f} Wh"
+                            )
+                            
+                            # Update live metrics
+                            with metrics_cols[0]:
+                                st.metric("Current Cycle", cycle_result.cycle_index, delta=None)
+                            with metrics_cols[1]:
+                                st.metric(
+                                    "Capacity Retention", 
+                                    f"{metrics['capacity_retention']:.1%}",
+                                    delta=f"{(metrics['capacity_retention'] - 1) * 100:.2f}%"
+                                )
+                            with metrics_cols[2]:
+                                st.metric("Energy (Wh)", f"{metrics['total_energy']:.1f}")
+                            with metrics_cols[3]:
+                                st.metric(
+                                    "Resistance (mΩ)", 
+                                    f"{metrics['resistance_current']*1000:.2f}"
+                                )
+                    except StopIteration as e:
+                        result_tuple = e.value
+                        if result_tuple:
+                            results, df, output_path = result_tuple
+                    
+                    if results is None:
+                        # Fallback - re-read the output file
+                        st.warning("Getting results from output file...")
+                    
+                    progress_bar.progress(1.0, text="Simulation complete!")
+                    
                     st.session_state["results"] = results
                     st.session_state["df"] = df
                     st.session_state["run_complete"] = True
                     st.session_state["simulation_mode"] = simulation_mode
                     
-                    st.success(f"Simulation completed successfully! (Mode: {mode_label})")
+                    st.success(f"Streaming simulation completed! (Mode: {mode_label})")
                     
-                    Path(output_path).unlink(missing_ok=True)
+                    if output_path:
+                        Path(output_path).unlink(missing_ok=True)
                     
                 except Exception as e:
                     st.error(f"Simulation failed: {str(e)}")
                     st.session_state["run_complete"] = False
+            else:
+                # Standard batch mode - use simple spinner
+                with st.spinner(f"Running {mode_label} simulation... This may take a moment."):
+                    try:
+                        results, df, output_path = run_simulation(
+                            chemistry=chemistry,
+                            capacity=capacity,
+                            protocol_type=protocol_type,
+                            protocol_params=protocol_params,
+                            output_format=output_format,
+                            enable_degradation=enable_degradation,
+                            noise_voltage=noise_voltage,
+                            noise_current=noise_current,
+                            noise_temperature=noise_temperature,
+                            simulation_mode=simulation_mode,
+                            pybamm_model=pybamm_model,
+                            pybamm_parameter_set=pybamm_parameter_set,
+                            pack_config=pack_config,
+                        )
+                        
+                        st.session_state["results"] = results
+                        st.session_state["df"] = df
+                        st.session_state["run_complete"] = True
+                        st.session_state["simulation_mode"] = simulation_mode
+                        
+                        st.success(f"Simulation completed successfully! (Mode: {mode_label})")
+                        
+                        Path(output_path).unlink(missing_ok=True)
+                        
+                    except Exception as e:
+                        st.error(f"Simulation failed: {str(e)}")
+                        st.session_state["run_complete"] = False
     
     if st.session_state.get("run_complete", False):
         results = st.session_state["results"]
@@ -1038,6 +1402,65 @@ def page_single_simulation():
                     st.plotly_chart(create_capacity_retention_chart(results.cycle_summary), use_container_width=True)
                 with col2:
                     st.plotly_chart(create_efficiency_chart(results.cycle_summary), use_container_width=True)
+                
+                # Three-component degradation breakdown (LFP paper model)
+                if "calendar_loss" in results.cycle_summary.columns:
+                    st.subheader("Degradation Component Breakdown")
+                    st.caption(
+                        "Stacked view of calendar aging, cycling break-in, and "
+                        "long-term cycling contributions to total capacity loss "
+                        "(LFP three-component paper model)."
+                    )
+                    st.plotly_chart(
+                        create_degradation_component_chart(results.cycle_summary),
+                        use_container_width=True,
+                    )
+                    
+                    # Stress-factor heatmaps
+                    if (
+                        results.backend_info
+                        and results.backend_info.get("degradation_model") == "lfp_paper_three_component"
+                    ):
+                        st.subheader("Stress Factor Heatmaps")
+                        st.caption(
+                            "Visualise how operating conditions affect each degradation "
+                            "mode. Red = high stress, yellow = low stress."
+                        )
+                        from battery_simulator.core.lfp_paper_degradation import (
+                            LFPPaperDegradationModel,
+                            LFPPaperParameters,
+                        )
+                        # Build a temporary model for heatmap computation
+                        _hm_model = LFPPaperDegradationModel(
+                            chemistry=None,
+                            nominal_capacity=results.capacity_initial,
+                            params=LFPPaperParameters(),
+                        )
+                        hm_col1, hm_col2 = st.columns(2)
+                        with hm_col1:
+                            st.plotly_chart(
+                                create_stress_heatmap(
+                                    param_func=lambda soc, temp: _hm_model.calendar_stress_rate(temp, soc),
+                                    x_label="SOC",
+                                    y_label="Temperature (°C)",
+                                    x_range=(0.05, 0.95),
+                                    y_range=(10, 55),
+                                    title="Calendar Aging Rate vs SOC & Temperature",
+                                ),
+                                use_container_width=True,
+                            )
+                        with hm_col2:
+                            st.plotly_chart(
+                                create_stress_heatmap(
+                                    param_func=lambda soc, dod: _hm_model.breakin_stress(soc, dod),
+                                    x_label="Average SOC",
+                                    y_label="DOD",
+                                    x_range=(0.05, 0.95),
+                                    y_range=(0.05, 1.0),
+                                    title="Break-in Magnitude vs SOC & DOD",
+                                ),
+                                use_container_width=True,
+                            )
         
         with tab2:
             max_cycle = int(df["cycle_index"].max()) if "cycle_index" in df.columns else 1

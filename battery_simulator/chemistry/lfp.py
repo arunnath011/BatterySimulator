@@ -17,12 +17,27 @@ class LFPChemistry(BaseChemistry):
     - Flat voltage profile
     - Common in stationary storage and some EVs
     
-    Degradation characteristics:
+    Degradation model:
+    - Supports the standard Arrhenius-based model (backward compatible)
+    - Also supports the three-component paper model from
+      "ML-Assisted Identification of Accurate Battery Lifetime Models
+      with Uncertainty" when ``use_paper_model=True``.
+    
+    Standard degradation characteristics:
     - E_a,cyc = 30 kJ/mol (lower temperature sensitivity)
     - z = 0.5 (square-root cycle dependence)
     - alpha = 0.25 (weak C-rate dependence - robust to high rates)
     - Moderate SOC dependence for calendar aging
+    
+    Paper model (three-component):
+    - Calendar aging: sigmoidal + linear (Eq. 6, 7, 8)
+    - Cycling break-in: saturation within ~4000 EFC (Eq. 11, 12)
+    - Long-term cycling: power law (Eq. 14, 15)
+    - Path-independent incremental updates (Eq. 20)
     """
+
+    # Whether to use the three-component paper model for LFP degradation
+    use_paper_model: bool = True
 
     def _init_parameters(self) -> None:
         """Initialize LFP-specific parameters."""
@@ -51,7 +66,7 @@ class LFPChemistry(BaseChemistry):
         self.resistance_growth_rate = 0.01  # % per 100 cycles
         self.calendar_fade_rate = 0.01  # % per year at 25°C
 
-        # Semi-empirical degradation parameters for LFP
+        # Semi-empirical degradation parameters for LFP (standard Arrhenius)
         # Calibrated for ~10% capacity loss at 2000 cycles, 1C, 25°C
         self.degradation_params = DegradationParameters(
             # Cycle aging
@@ -75,6 +90,10 @@ class LFPChemistry(BaseChemistry):
             t_ref=298.0,
             c_ref=1.0,
         )
+
+        # Paper model parameters (Table IV) for three-component degradation
+        # These are used when use_paper_model is True
+        self._paper_model_params = None  # Lazy-loaded via get_paper_params()
 
         # OCV vs SOC table (characteristic flat LFP curve)
         self.ocv_table = [
@@ -101,3 +120,15 @@ class LFPChemistry(BaseChemistry):
             [0.95, 3.55],
             [1.00, 3.65],
         ]
+
+    def get_paper_params(self):
+        """
+        Get the three-component paper model parameters (Table IV).
+
+        Returns:
+            LFPPaperParameters instance with calibrated values.
+        """
+        if self._paper_model_params is None:
+            from battery_simulator.core.lfp_paper_degradation import LFPPaperParameters
+            self._paper_model_params = LFPPaperParameters()
+        return self._paper_model_params

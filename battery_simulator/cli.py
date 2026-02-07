@@ -8,9 +8,14 @@ from pathlib import Path
 
 import click
 
-from battery_simulator import BatterySimulator
+from battery_simulator import BatterySimulator, CycleResult
 from battery_simulator.chemistry import Chemistry
-from battery_simulator.core.simulator import SimulationConfig, TimingMode
+from battery_simulator.core.simulator import (
+    SimulationConfig,
+    TimingMode,
+    StreamingMode,
+    StreamingConfig,
+)
 from battery_simulator.protocols import Protocol
 
 
@@ -107,6 +112,17 @@ def main():
     default=None,
     help="Random seed for reproducibility",
 )
+@click.option(
+    "--streaming",
+    is_flag=True,
+    help="Enable streaming mode - output data after each cycle completes",
+)
+@click.option(
+    "--streaming-callback",
+    type=click.Choice(["print", "json", "none"]),
+    default="print",
+    help="Streaming callback type (print: show progress, json: output JSON per cycle)",
+)
 def run(
     config: Path | None,
     chemistry: str,
@@ -121,6 +137,8 @@ def run(
     speed: float,
     no_progress: bool,
     seed: int | None,
+    streaming: bool,
+    streaming_callback: str,
 ):
     """
     Run a battery simulation.
@@ -175,12 +193,19 @@ def run(
     click.echo(f"  Output Format: {output_format}")
     click.echo(f"  Output Path: {output}")
     click.echo(f"  Timing Mode: {timing}")
+    click.echo(f"  Streaming Mode: {'Enabled' if streaming else 'Disabled'}")
     if seed:
         click.echo(f"  Random Seed: {seed}")
     click.echo("")
 
     # Create timing mode enum
     timing_mode = TimingMode(timing)
+    
+    # Create streaming config if enabled
+    streaming_config = StreamingConfig(
+        mode=StreamingMode.PER_CYCLE if streaming else StreamingMode.BATCH,
+        flush_after_cycle=True,
+    )
 
     # Create simulation config
     sim_config = SimulationConfig(
@@ -188,6 +213,7 @@ def run(
         speed_factor=speed,
         random_seed=seed,
         enable_degradation=True,
+        streaming=streaming_config,
     )
 
     # Create simulator
@@ -218,14 +244,58 @@ def run(
     # Ensure output directory exists
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    # Define streaming callback if needed
+    def print_cycle_callback(result: CycleResult) -> None:
+        """Print cycle completion info."""
+        metrics = result.cumulative_metrics
+        click.echo(
+            f"  Cycle {result.cycle_index}: "
+            f"Retention={metrics['capacity_retention']:.2%}, "
+            f"Resistance={metrics['resistance_current']*1000:.2f}mΩ, "
+            f"Energy={metrics['total_energy']:.2f}Wh"
+        )
+    
+    def json_cycle_callback(result: CycleResult) -> None:
+        """Output JSON per cycle."""
+        click.echo(json.dumps(result.to_dict()))
+
     # Run simulation
     click.echo("Running simulation...")
-    results = sim.run(
-        protocol=test_protocol,
-        output_path=output,
-        output_format=output_format,
-        show_progress=not no_progress,
-    )
+    
+    if streaming:
+        # Use streaming mode
+        if streaming_callback == "print":
+            sim.on_cycle_complete(print_cycle_callback)
+        elif streaming_callback == "json":
+            sim.on_cycle_complete(json_cycle_callback)
+        
+        # Run with streaming generator - exhaust the generator to complete
+        generator = sim.run_streaming(
+            protocol=test_protocol,
+            output_path=output,
+            output_format=output_format,
+            show_progress=not no_progress and streaming_callback != "json",
+        )
+        
+        # Iterate through all cycles
+        try:
+            while True:
+                next(generator)
+        except StopIteration as e:
+            # Generator returns the final results
+            results = e.value
+        
+        # Fallback: get results from simulator if generator didn't return them
+        if results is None:
+            results = sim.get_streaming_results()
+    else:
+        # Standard batch mode
+        results = sim.run(
+            protocol=test_protocol,
+            output_path=output,
+            output_format=output_format,
+            show_progress=not no_progress,
+        )
 
     # Display results
     click.echo("\n" + "=" * 60)
